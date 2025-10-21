@@ -115,7 +115,7 @@ ChimD_Bayes <- left_join(ChimD, host_wasp_depth , by = c("sample")) %>%
     select(-host_BUSCO_depth)
     
 # Export dataset for Bayesian analysis
-write.table(ChimD_Bayes, "chimera_depth_Bayes_18_03_25.txt", sep='\t', quote = FALSE, row.names = FALSE, col.names = TRUE)
+write.table(ChimD_Bayes, "chimera_depth_Bayes.txt", sep='\t', quote = FALSE, row.names = FALSE, col.names = TRUE)
 
 # ============================================================================
 # DATA STANDARDIZATION FOR VISUALIZATION
