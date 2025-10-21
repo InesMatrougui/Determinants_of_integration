@@ -1,4 +1,4 @@
-# Determiant_of_integration
+# Determinant_of_integration
 Determiant_of_integration includes R scripts that process data in the same way as in XXXX.
 
 It is composed of several scripts, located in `src/`, to run in the same order as listed here. The scripts process the number of integrations and sequencing depth specifically to determine the factors influencing genomic polydnavirus integration.
