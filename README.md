@@ -11,13 +11,18 @@ Chimera and Depth Data Processing
 This script requires two main input files, each representing merged data from all analyzed samples.
 
 1. File: all_chimera.csv – Chimera Data
+
 This file contains information about chimeric sequences detected along HIM segments.
 The original data came from files named `${samples}_all_chimera_alongHIMs_IE.txt`, which were generated through a two-step process:
+
   Step 1: Execution of the WorkflowBowBlast pipeline https://github.com/HeloiseMuller/WorkflowBowBlast with the blastn=TRUE option enabled. This step produces BLASTn alignments.
+  
   Step 2: Use of the script `3-FindChimera_alongSegments.R` part of the Chimera pipeline. This script processes the BLASTn results to identify chimeric reads along HIM segments.
+  
 The file all_chimera.csv is a merged version of the outputs from all samples.
 
-2. File: all_depth.csv – Coverage (Depth) Data
+3. File: all_depth.csv – Coverage (Depth) Data
+4. 
 This file contains depth of coverage information for all samples, aggregated along specific segments.
 The original data were stored in files named `${samples}_coverage_positions`, generated using the CovWindows software https://github.com/HeloiseMuller/CovWindows
 These files were produced with the following command:
