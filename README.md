@@ -21,10 +21,11 @@ The original data came from files named `${samples}_all_chimera_alongHIMs_IE.txt
   
 The file all_chimera.csv is a merged version of the outputs from all samples.
 
-3. File: all_depth.csv – Coverage (Depth) Data
-4. 
+2. File: all_depth.csv – Coverage (Depth) Data
+ 
 This file contains depth of coverage information for all samples, aggregated along specific segments.
-The original data were stored in files named `${samples}_coverage_positions`, generated using the CovWindows software https://github.com/HeloiseMuller/CovWindows
+The original data were stored in files named `${samples}_coverage_positions`, generated using the CovWindows software https://github.com/HeloiseMuller/CovWindows.
+
 These files were produced with the following command:
 ```
 CovWindows/build/CovWindows -w Segments_coordinates.txt -f -c ${samples}_trimmed_vs_${wasp}_coverage_positions -d -o ${samples}_coverage_positions
