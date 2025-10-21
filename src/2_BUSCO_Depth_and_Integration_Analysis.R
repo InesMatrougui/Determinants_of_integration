@@ -1,9 +1,6 @@
 library(dplyr)
 library(ggplot2)
 library(tidyverse)
-library(ggpirate)
-library(ggtree)
-library(ape)
 
 # ============================================================================
 # DEPTH BUSCO ANALYSIS
