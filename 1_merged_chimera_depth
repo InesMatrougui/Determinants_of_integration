@@ -1,0 +1,102 @@
+library(dplyr)
+library(tidyverse)
+
+
+setwd("dir")
+
+# data  
+  # chimera is the merging of each output files ${samples}_all_chimera_alongHIMs_IE.txt coming from WokflowBowBlast blastn=TRUE https://github.com/HeloiseMuller/WorkflowBowBlast
+chimera <-read.csv("all_chimera.csv", header = TRUE, sep = ";")
+  # depth is the merging of each output files ${samples}_coverage_positions coming from CovWindows software https://github.com/HeloiseMuller/CovWindows
+  # CovWindows/build/CovWindows -w Segments_coordinates. -f -c ${samples}_trimmed_vs_${wasp}_coverage_positions -d -o ${samples}_coverage_positions
+  # ${samples}_trimmed_vs_${wasp}_coverage_positions file come from WokflowBowBlast bowtie2=TRUE coverage=TRUE https://github.com/HeloiseMuller/WorkflowBowBlast 
+depth <-read.csv("all_depth.csv", header = TRUE, sep = ";")
+
+### manipulation of data ###
+
+# calculate the number of integration by segments and by species
+
+Chim_seg <- group_by(chimera, sample, Segment) %>% 
+  summarise(int=n())
+
+# merge the two tables (Nb chimera and depth)
+
+ChimD <- left_join(depth, Chim_seg , by = c("sample", "Segment")) %>% 
+  select(sample, wasp, host, Segment, int, depth)
+
+
+# PROBLEME : integrations of circle 10 merge with those of circle 17 for Ci, Csm and Csk because the HIM of these circle are identical
+# All integrations of these circles are redistributed in function of according to depth on the circles/segments
+
+# Ci
+ChimD_10_17 <- dplyr::filter(ChimD, wasp=="cotesia_icipe", Segment=="Segment_10"|Segment=="Segment_17")
+int1_10 = (ChimD_10_17[3,6]/(ChimD_10_17[4,6]+ChimD_10_17[3,6]))*(ChimD_10_17[4,5]+ChimD_10_17[3,5])
+int1_17 = (ChimD_10_17[4,6]/(ChimD_10_17[4,6]+ChimD_10_17[3,6]))*(ChimD_10_17[4,5]+ChimD_10_17[3,5])
+int2_10 = (ChimD_10_17[1,6]/(ChimD_10_17[2,6]+ChimD_10_17[1,6]))*(ChimD_10_17[2,5]+ChimD_10_17[1,5])
+int2_17 = (ChimD_10_17[2,6]/(ChimD_10_17[2,6]+ChimD_10_17[1,6]))*(ChimD_10_17[2,5]+ChimD_10_17[1,5])
+
+ChimD <- mutate(ChimD , int=if_else((sample=="SfCi2" & Segment=="Segment_10"), int2_10, int),
+                int=if_else((sample=="SfCi2" & Segment=="Segment_17"), int2_17, int),
+                int=if_else((sample=="SfCi1" & Segment=="Segment_10"), int1_10, int),
+                int=if_else((sample=="SfCi1" & Segment=="Segment_17"), int1_17, int))  
+rm(ChimD_10_17)
+# CsM
+ChimD_10_17 <- filter(ChimD, wasp=="cotesia_sesamiae_mombasa", Segment=="Segment_10"|Segment=="Segment_17")%>% 
+  mutate_all( ~replace(., is.na(.), 0))
+int1_10 = (ChimD_10_17[3,6]/(ChimD_10_17[4,6]+ChimD_10_17[3,6]))*(ChimD_10_17[4,5]+ChimD_10_17[3,5])
+int1_17 = (ChimD_10_17[4,6]/(ChimD_10_17[4,6]+ChimD_10_17[3,6]))*(ChimD_10_17[4,5]+ChimD_10_17[3,5])
+int2_10 = (ChimD_10_17[1,6]/(ChimD_10_17[2,6]+ChimD_10_17[1,6]))*(ChimD_10_17[2,5]+ChimD_10_17[1,5])
+int2_17 = (ChimD_10_17[2,6]/(ChimD_10_17[2,6]+ChimD_10_17[1,6]))*(ChimD_10_17[2,5]+ChimD_10_17[1,5])
+int3_10 = (ChimD_10_17[5,6]/(ChimD_10_17[6,6]+ChimD_10_17[5,6]))*(ChimD_10_17[6,5]+ChimD_10_17[5,5])
+int3_17 = (ChimD_10_17[6,6]/(ChimD_10_17[6,6]+ChimD_10_17[5,6]))*(ChimD_10_17[6,5]+ChimD_10_17[5,5])
+int4_10 = (ChimD_10_17[7,6]/(ChimD_10_17[8,6]+ChimD_10_17[7,6]))*(ChimD_10_17[8,5]+ChimD_10_17[7,5])
+int4_17 = (ChimD_10_17[8,6]/(ChimD_10_17[8,6]+ChimD_10_17[7,6]))*(ChimD_10_17[7,5]+ChimD_10_17[8,5])
+int5_10 = (ChimD_10_17[9,6]/(ChimD_10_17[10,6]+ChimD_10_17[9,6]))*(ChimD_10_17[10,5]+ChimD_10_17[9,5])
+int5_17 = (ChimD_10_17[10,6]/(ChimD_10_17[10,6]+ChimD_10_17[9,6]))*(ChimD_10_17[10,5]+ChimD_10_17[9,5])
+int6_10 = (ChimD_10_17[11,6]/(ChimD_10_17[12,6]+ChimD_10_17[11,6]))*(ChimD_10_17[12,5]+ChimD_10_17[11,5])
+int6_17 = (ChimD_10_17[12,6]/(ChimD_10_17[12,6]+ChimD_10_17[11,6]))*(ChimD_10_17[12,5]+ChimD_10_17[11,5])
+ChimD <- mutate(ChimD , int=if_else((sample=="BfCsCo1" & Segment=="Segment_10"), int2_10, int),
+                int=if_else((sample=="BfCsCo1" & Segment=="Segment_17"), int2_17, int),
+                int=if_else((sample=="BfCsCo2" & Segment=="Segment_10"), int1_10, int),
+                int=if_else((sample=="BfCsCo2" & Segment=="Segment_17"), int1_17, int), 
+                int=if_else((sample=="BfCsCo3" & Segment=="Segment_17"), int3_17, int),
+                int=if_else((sample=="BfCsCo3" & Segment=="Segment_10"), int3_10, int),
+                int=if_else((sample=="Co1" & Segment=="Segment_17"), int4_17, int),
+                int=if_else((sample=="Co1" & Segment=="Segment_17"), int4_17, int),
+                int=if_else((sample=="Co2" & Segment=="Segment_10"), int5_10, int),
+                int=if_else((sample=="Co2" & Segment=="Segment_17"), int5_17, int),
+                int=if_else((sample=="Co3" & Segment=="Segment_10"), int6_10, int),
+                int=if_else((sample=="Co3" & Segment=="Segment_17"), int6_17, int)) 
+rm(ChimD_10_17)
+# CsK
+ChimD_10_17 <- filter(ChimD, wasp=="cotesia_sesamiae_kitale", Segment=="Segment_10"|Segment=="Segment_17")%>% 
+  mutate_all( ~replace(., is.na(.), 0))
+int1_10 = (ChimD_10_17[3,6]/(ChimD_10_17[4,6]+ChimD_10_17[3,6]))*(ChimD_10_17[4,5]+ChimD_10_17[3,5])
+int1_17 = (ChimD_10_17[4,6]/(ChimD_10_17[4,6]+ChimD_10_17[3,6]))*(ChimD_10_17[4,5]+ChimD_10_17[3,5])
+int2_10 = (ChimD_10_17[1,6]/(ChimD_10_17[2,6]+ChimD_10_17[1,6]))*(ChimD_10_17[2,5]+ChimD_10_17[1,5])
+int2_17 = (ChimD_10_17[2,6]/(ChimD_10_17[2,6]+ChimD_10_17[1,6]))*(ChimD_10_17[2,5]+ChimD_10_17[1,5])
+int3_10 = (ChimD_10_17[5,6]/(ChimD_10_17[6,6]+ChimD_10_17[5,6]))*(ChimD_10_17[6,5]+ChimD_10_17[5,5])
+int3_17 = (ChimD_10_17[6,6]/(ChimD_10_17[6,6]+ChimD_10_17[5,6]))*(ChimD_10_17[6,5]+ChimD_10_17[5,5])
+int4_10 = (ChimD_10_17[7,6]/(ChimD_10_17[8,6]+ChimD_10_17[7,6]))*(ChimD_10_17[8,5]+ChimD_10_17[7,5])
+int4_17 = (ChimD_10_17[8,6]/(ChimD_10_17[8,6]+ChimD_10_17[7,6]))*(ChimD_10_17[7,5]+ChimD_10_17[8,5])
+int5_10 = (ChimD_10_17[9,6]/(ChimD_10_17[10,6]+ChimD_10_17[9,6]))*(ChimD_10_17[10,5]+ChimD_10_17[9,5])
+int5_17 = (ChimD_10_17[10,6]/(ChimD_10_17[10,6]+ChimD_10_17[9,6]))*(ChimD_10_17[10,5]+ChimD_10_17[9,5])
+int6_10 = (ChimD_10_17[11,6]/(ChimD_10_17[12,6]+ChimD_10_17[11,6]))*(ChimD_10_17[12,5]+ChimD_10_17[11,5])
+int6_17 = (ChimD_10_17[12,6]/(ChimD_10_17[12,6]+ChimD_10_17[11,6]))*(ChimD_10_17[12,5]+ChimD_10_17[11,5])
+ChimD <- mutate(ChimD , int=if_else((sample=="BfCsIn3" & Segment=="Segment_10"), int2_10, int),
+                int=if_else((sample=="BfCsIn3" & Segment=="Segment_17"), int2_17, int),
+                int=if_else((sample=="BfCsIn2" & Segment=="Segment_10"), int1_10, int),
+                int=if_else((sample=="BfCsIn2" & Segment=="Segment_17"), int1_17, int), 
+                int=if_else((sample=="BfCsIn1" & Segment=="Segment_17"), int3_17, int),
+                int=if_else((sample=="BfCsIn1" & Segment=="Segment_10"), int3_10, int),
+                int=if_else((sample=="In1" & Segment=="Segment_17"), int4_17, int),
+                int=if_else((sample=="In1" & Segment=="Segment_17"), int4_17, int),
+                int=if_else((sample=="In2" & Segment=="Segment_10"), int5_10, int),
+                int=if_else((sample=="In2" & Segment=="Segment_17"), int5_17, int),
+                int=if_else((sample=="In3" & Segment=="Segment_10"), int6_10, int),
+                int=if_else((sample=="In3" & Segment=="Segment_17"), int6_17, int)) 
+rm(ChimD_10_17)
+
+
+write.table(ChimD, "chimera_depth.txt", sep='\t', quote = FALSE, row.names = FALSE, col.names = TRUE)
+
