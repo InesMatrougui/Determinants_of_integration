@@ -1070,8 +1070,8 @@ zinb_ppd <- function(model, int_data, draw_number, plot_by_depth = FALSE, plot_b
 
 # Read in and clean data
 ######
-int_data <- read.csv("chimera_depth_Bayes_18_03_25.txt", sep = "\t")
-ls_data <- read.csv("depth_nb_reads_30.05.txt", sep = "\t")
+int_data <- read.csv("chimera_depth_Bayes.txt", sep = "\t")
+ls_data <- read.csv("depth_nb_reads.txt", sep = "\t") # nb_read is the library size 
 # extract library size data and tack it on as an extra column in
 # the main data frame
 ls <- c()
