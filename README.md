@@ -5,7 +5,7 @@ It is composed of several scripts, located in `src/`, to run in the same order a
 
 In `examples/`, you will find examples of files needed to run the scripts. Examples are provided for the number of integrations and sequencing depth of host-wasp systems involving four species of Cotesia wasps and five species of lepidopteran hosts. All of this data was produced using Chimera https://github.com/HeloiseMuller/Chimera and WorkflowBowBlast https://github.com/HeloiseMuller/WorkflowBowBlast pipelines.
 
-# 1_merged_chimera_depth.R
+## 1_merged_chimera_depth.R
 Chimera and Depth Data Processing
 ### Input
 - `all_chimera.csv` : Chimera Data
