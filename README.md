@@ -15,7 +15,7 @@ The original data came from files named `${samples}_all_chimera_alongHIMs_IE.txt
 
   Step 1: Execution of the WorkflowBowBlast pipeline https://github.com/HeloiseMuller/WorkflowBowBlast with the blastn=TRUE option enabled. This step produces BLASTn alignments.
   
-  Step 2: Use of the script `3-FindChimera_alongSegments.R` part of the Chimera pipeline. This script processes the BLASTn results to identify chimeric reads along HIM segments.
+  Step 2: Use of the script `3-FindChimera_alongSegments.R` part of the Chimera pipeline https://github.com/HeloiseMuller/Chimera. This script processes the BLASTn results to identify chimeric reads.
   
 The file all_chimera.csv is a merged version of the outputs from all samples.
 
