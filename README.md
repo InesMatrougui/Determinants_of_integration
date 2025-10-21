@@ -60,7 +60,7 @@ This R script implements a Bayesian framework (using `Stan` via `brms` and rstan
 
 ### Output
 This script generates the figures for posterior plots (figures 3 to 7 and S9), posterior predictive checks (figures S7 and S13), posterior predictive checks of simulation (figure S11 and S12) available in XXXX.
-This script also generates tables of posterior estimates of zero-inflation `Supplementary_Table_1.tsv` available in XXXX.
+This script also generates table of posterior estimates of zero-inflation `Supplementary_Table_1.tsv` available in XXXX.
 
 # Graph_article.R
 Data visualizations and Statistical summaries
