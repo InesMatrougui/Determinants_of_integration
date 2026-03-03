@@ -8,6 +8,7 @@ library(gridExtra)      # For arranging multiple plots
 library(ggpubr)         # For publication-ready figures
 library(ggpirate)       # For pirate plots
 library(ape)            # For phylogenetic tree manipulation
+library(ggtree)         # For phylogenetic tree manipulation
 
 setwd("dir")
 
@@ -73,9 +74,12 @@ ggsave(filename = "figure_bilan.pdf",
 myTree <- ape::read.tree(text = "(Cotesia_icipe:0.0424299990,(Cotesia_flavipes:0.0095996158,((Cotesia_sesamiae_kitale:0.0025423157,Cotesia_sesamiae_mombasa:0.0032904776)100/100:0.0038223243,Cotesia_typhae:0.0061466487)100/100:0.0219293140)100/100:0.0131139270);")
 
 # Display and save phylogenetic tree with scale bar
-pdf(file = "figure_bilan_phylo.pdf") 
-add.scale.bar(plot(myTree))
-dev.off()
+p <- ggtree(myTree) + 
+  geom_tiplab(align=TRUE, linesize=.5) + geom_treescale() +
+  xlim(0, max(nodeHeights(myTree)) * 2) +
+  geom_text2(aes(label=label, subset = !isTip), hjust=-0.3, size=3)   
+
+ggsave("figure_bilan_phylo.pdf", p, height = 8, width = 5)
 
 # ============================================================================
 # SAMPLE NAME MAPPING
