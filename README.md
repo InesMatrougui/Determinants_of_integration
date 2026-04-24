@@ -1,5 +1,5 @@
 # Determinants of integration
-Determinants_of_integration includes R scripts that process data in the same way as in XXXX.
+Determinants_of_integration includes R scripts that process data in the same way as in Matrougui et al, manuscript under review.
 
 It is composed of several scripts, located in `src/`, to run in the same order as listed here. The scripts process the number of integrations and sequencing depth specifically to determine the factors influencing genomic polydnavirus integration.
 
@@ -59,8 +59,8 @@ This R script implements a Bayesian framework (using `Stan` via `brms` and rstan
 - `depth_nb_reads.txt` : library size per samples
 
 ### Output
-This script generates the figures for posterior plots (figures 3 to 7 and S9), posterior predictive checks (figures S7 and S13), posterior predictive checks of simulation (figure S11 and S12) available in XXXX.
-This script also generates table of posterior estimates of zero-inflation `Supplementary_Table_1.tsv` available in XXXX.
+This script generates the figures for posterior plots (figures 3 to 7 and S9), posterior predictive checks (figures S7 and S13), posterior predictive checks of simulation (figure S11 and S12) will be available in Matrougui et al, manuscript under review.
+This script also generates table of posterior estimates of zero-inflation `Supplementary_Table_1.tsv` will be available in Matrougui et al, manuscript under review.
 
 ## Graph_article.R
 Data visualizations and Statistical summaries
