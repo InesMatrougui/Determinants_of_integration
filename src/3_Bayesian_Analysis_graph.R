@@ -1,91 +1,20 @@
 # Import packages
-library(Biostrings) 
+library(Biostrings)
 library(brms)
-library(rethinking)
+library(coda)
+library(ggtree)
+library(MASS)
 library(tidyverse)
 library(ggridges)
-library(ggtext)
-library(rstan)
+library(ggcorrplot)
+library(gridExtra)
+library(gtools)
+library(phytools)
 library(stringr)
 library(vioplot)
 
 # Functions
 ######
-# Convert a categorical variable into a series of 0-1 encoded 
-# numerical vectors for use with Stan
-cat_to_num <- function(variable, baseline) {
-  # the output will be a matrix
-  # it will have as many columns as there are different possible values
-  # of the categorical variable minus 1
-  # and as many rows as there are observations
-  # set everything to 0 to start with
-  out_mat <- matrix(0L, nrow = length(variable), ncol = length(unique(variable)) - 1)
-  counter <- 0
-  columns <- c()
-  # loop over the unique values of the categorical variable
-  for (value in unique(variable)) {
-    # ignore the default category
-    if (!value == baseline) {
-      counter <- counter + 1
-      # otherwise insert a 1 in the appropriate column
-      # for all the observations that equal the current value
-      out_mat[variable == value, counter] <- 1
-      columns <- c(columns, value)
-    }
-  }
-  colnames(out_mat) <- columns
-  return(out_mat)
-}
-
-# compare predicted numbers of integrations between
-# two predictor categories
-compare_two_categories <- function(model, column1, column2, names, variable, intercept = FALSE) {
-  # the column1 and column2 variables give the column in the matrix X 
-  # (see run_stan_model())
-  par(mfrow = c(1,1))
-  draws <- as.matrix(model)
-  beta_pos <- str_starts(colnames(draws), "beta\\[")
-  betas <- draws[, beta_pos]
-  # if the first category is the baseline and therefore can be read
-  # out from the intercept
-  if (intercept == TRUE) {
-    base_cat <- exp(draws[, "beta0"])
-  }
-  else {
-    base_cat <- exp(draws[, column1])
-  }
-  other_cat <- exp(draws[, "beta0"] + betas[, column2])
-  pink_trans <- rgb(255,192,203, alpha = 10, 
-                    maxColorValue = 255) 
-  fully_trans <- rgb(255,255,255, alpha = 0, 
-                     maxColorValue = 255) 
-  # prepare plotting area
-  plot(other_cat ~ rep(c(1, 3), length.out = length(other_cat)),
-       pch = "", xlab = variable, 
-       ylab = "Estimated mean # of int", xaxt = "n",
-       ylim = c(0, max(c(base_cat, other_cat))))
-  # make lines for MCMC draws
-  for (draw in 1:length(other_cat)) {
-    lines(c(base_cat[draw], other_cat[draw]) ~ c(1.5, 2.5),
-          col = pink_trans)
-  }
-  # make violin plots of the MCMC draws
-  vioplot(base_cat, add = TRUE, col = fully_trans, at = 1.5)
-  vioplot(other_cat, add = TRUE, col = fully_trans, at = 2.5)
-  mtext(names,
-        side = 1, line = 0, at = c(1.5, 2.5))
-  
-  diffs <- other_cat - base_cat
-  print("Median of the posterior:")
-  print(median(diffs))
-  print("95% HPDI:")
-  print(HPDI(diffs, 0.95))
-  print("Probability higher:")
-  print(mean(diffs > 0) * 100)
-  print("Probability lower:")
-  print(mean(diffs < 0) * 100)
-}
-
 # show posterior predictions as a function of depth,
 # plot observed data on top to compare
 depth_ppd <- function(model, data, file_out, depth_metric, main, norm, mean = FALSE) {
@@ -122,25 +51,13 @@ depth_ppd <- function(model, data, file_out, depth_metric, main, norm, mean = FA
   dev.off()
 }
 
-# generate posterior predictions for Stan model
-get_ppd <- function(model) {
-  # get MCMC draws
-  draws <- as.matrix(model)
-  # which columns in the draws correspond to values of mu?
-  mu_spots <- str_starts(colnames(draws), "mu")
-  # generate matrix of 0s to be filled with posterior predictions
-  out_mat <- matrix(0L, nrow = dim(draws)[1], ncol = sum(mu_spots))
-  for (draw in 1:dim(draws)[1]) {
-    curr_values <- rnbinom(sum(mu_spots), mu = draws[draw, mu_spots], size = draws[draw, colnames(draws) == "phi"])
-    out_mat[draw,] <- curr_values
-  }
-  return(out_mat)
-}
-
 # print out the 95% HPDI for the difference between the 
 # expected number of integrations
 # at two different depths
-depth_effect_HPDI <- function(model, depths) {
+depth_effect_HPDI <- function(model, depths, original_vector) {
+  # get mean and SD of original vector for scaling
+  scale_mean <- mean(original_vector)
+  scale_sd <- sd(original_vector)
   # extract draws
   draws <- as.matrix(model)
   # get the coefficient for depth
@@ -150,10 +67,12 @@ depth_effect_HPDI <- function(model, depths) {
   # convert the provided raw depth values to the cube root
   transf <- depths[1] ^ (1/3)
   print(transf ^ 3)
+  transf <- (transf - scale_mean)/scale_sd
   # get expected counts at first depth value
   epred1 <- exp(intercepts + transf * depth_coefs)
   transf <- depths[2] ^ (1/3)
   print(transf ^ 3)
+  transf <- (transf - scale_mean)/scale_sd
   # get expected counts at second depth value
   epred2 <- exp(intercepts + transf * depth_coefs)
   # get difference 
@@ -161,58 +80,132 @@ depth_effect_HPDI <- function(model, depths) {
   print("median of the posterior:")
   print(median(diffs))
   print("95% HPDI:")
-  print(HPDI(diffs, 0.95))
+  print(HPDinterval(as.mcmc(diffs), prob = 0.95))
+  print("% above 0:")
+  print(mean(diffs > 0) * 100)
 }
 
-# plot predicted distribution of mean numbers of integrations
-plot_mus <- function(model) {
-  # extract MCMC draws corresponding to mu
-  draws <- as.matrix(model)
-  mu_pos <- str_starts(colnames(draws), "mu")
-  mus <- draws[, mu_pos]
-  colnames(mus) <- colnames(draws)[mu_pos]
-  # average across draws
-  fitted_mu <- colMeans(mus)
-  # plot
-  hist(fitted_mu, xlab = "Mean number of integrations",
-       breaks = 20, col = "hotpink", 
-       main = "Neg. binomial component")
-}
-
-# plot predicted distribution of probability of failed oviposition
-plot_thetas <- function(model, int_data, file_name = file_name) {
-  # extract MCMC draws corresponding to theta
-  draws <- as.matrix(model)
-  theta_pos <- str_starts(colnames(draws), "theta")
-  theta <- draws[, theta_pos]
-  colnames(theta) <- levels(int_data$sample)
-  sample_no <- length(colnames(theta))
-  to_write <- data.frame("sample" = rep("NA", sample_no), "host" = rep("NA", sample_no), "wasp" = rep("NA", sample_no), "posterior_median" = rep(NA, sample_no), "HPDI_lower_bound_95_perc" = rep(NA, sample_no), "HPDI_upper_bound_95_perc" = rep(NA, sample_no))
-  print(to_write)
-  # print 95% HPDI for each sample
-  counter <- 1
-  for (coln in colnames(theta)) {
-    curr_hpdi <- HPDI(theta[,coln], 0.95)
-    print(paste(coln, ": ", curr_hpdi[1], " - ", curr_hpdi[2], sep = ""))
-    to_write[counter, "sample"] <- coln
-    to_write[counter, "host"] <- as.character(unique(int_data[int_data$sample == coln, "host"]))
-    to_write[counter, "wasp"] <- as.character(unique(int_data[int_data$sample == coln, "wasp"]))
-    to_write[counter, "posterior_median"] <- signif(median(theta[,coln]), 2)
-    to_write[counter, "HPDI_lower_bound_95_perc"] <- signif(curr_hpdi[1], 2)
-    to_write[counter, "HPDI_upper_bound_95_perc"] <- signif(curr_hpdi[2], 2)
-    counter <- counter + 1
+plot_order_corrs <- function(depth_ordered, dataset, wasps, parameter = "depth_cube_root_cpm", filter = c(),
+                             highlight = c()) {
+  depth_ordered <- as.character(depth_ordered)
+  if (length(filter) > 0) {
+    depth_ordered_copy <- depth_ordered
+    depth_ordered <- depth_ordered[depth_ordered %in% filter]
   }
-  # average across MCMC draws
-  fitted_zi <- colMeans(theta)
-  print(hist(fitted_zi, xlab = "Probability of failed oviposition",
-             breaks = 20, col = "royalblue", 
-             main = "Zero-inflated component"))
-  write.table(to_write, file = file_name, sep = "\t", quote = FALSE,
-              row.names = FALSE, col.names = TRUE)
+  depths <- matrix(0, nrow = length(depth_ordered),
+                   ncol = length(wasps))
+  circles_clean <- rep(0, length(depth_ordered))
+  for (seg in 1:length(depth_ordered)) {
+    curr_seg <- str_split(depth_ordered[seg], "_")[[1]]
+    if (length(curr_seg) > 2) {
+      curr_seg <- paste(curr_seg[2], curr_seg[3], sep = "_")
+    } else {
+      curr_seg <- curr_seg[2]
+    }
+    circles_clean[seg] <- curr_seg
+  }
+  wasps <- rev(c("C. sesamiae kitale", "C. sesamiae mombasa",
+             "C. typhae", "C. flavipes", "C. icipe"))
+  for (wasp in 1:length(wasps)) {
+    curr_dataset <- dataset[dataset$wasp == wasps[wasp],]
+    agg <- aggregate(curr_dataset[, parameter] ~ curr_dataset[, "Segment"],
+                     FUN = mean)
+    rownames(agg) <- agg[,1]
+    depths[, wasp] <- agg[depth_ordered, 2]
+  }
+  par(mfrow = c(1,1))
+  cor_matrix <- cor(depths, method = "spearman")
+  wasps_temp <- as.character(wasps)
+  wasps_temp <- lapply(wasps_temp, FUN = function(x) {y <- strsplit(x, " ")[[1]]; y[length(y)]})
+  wasps_temp <- rev(c("C. s. Kitale", "C. s. Mombasa", "C. typhae", "C. flavipes", "C. icipe"))
+  colnames(depths) <- wasps_temp
+  rownames(cor_matrix) <- wasps_temp
+  colnames(cor_matrix) <- wasps_temp
+  all_p <- c()
+  seen <- c()
+  for (w1 in wasps_temp) {
+    for (w2 in wasps_temp) {
+      if (w1 != w2) {
+        possible_strings <- c(paste(w1, w2), paste(w2, w1))
+        if (!(possible_strings[1] %in% seen) & !(possible_strings[2] %in% seen)) {
+          seen <- c(seen, possible_strings[1])
+          p <- cor.test(depths[, w1], depths[, w2], method = "spearman")$p.value
+          all_p <- c(all_p, p)
+        }
+      }
+    }
+  }
+  all_p <- signif(p.adjust(all_p, method = "holm"), 1)
+  p_mat <- matrix(1000, nrow = nrow(cor_matrix), ncol = ncol(cor_matrix))
+  colnames(p_mat) <- wasps_temp
+  rownames(p_mat) <- wasps_temp
+  for (w1 in wasps_temp) {
+    for (w2 in wasps_temp) {
+      if (w1 == w2) {
+        p_mat[w1, w2] <- 0
+      } else {
+        possible_strings <- c(paste(w1, w2), paste(w2, w1))
+        print(possible_strings)
+        print(seen)
+        curr_p <- all_p[seen == possible_strings[1]]
+        if (length(curr_p) == 0) {
+          curr_p <- all_p[seen == possible_strings[2]]
+          
+        }
+        p_mat[w1, w2] <- curr_p
+      }
+    }
+  }
+  tree <- read.newick("phylogeny.nwk")
+  pdf("new_version_of_Ines_manuscript/corrplot.pdf",
+      height = 5, width = 10)
+  tree_plot <- ggtree(tree, layout = "rectangular")  +
+    scale_y_continuous(expand=expand_scale(0.17))  +
+    theme(plot.margin = unit(c(-0.22,-2.3,2.2,0), "cm"))
+  corr_plot <- ggcorrplot(cor_matrix, hc.order = FALSE)  +
+    theme(plot.margin = unit(c(0,0,0,-2.3), "cm"),
+            legend.text = element_text(size=10),
+          legend.key.size = unit(1.5, 'cm'))
+  for (w1 in 1:length(wasps_temp)) {
+    for (w2 in 1:length(wasps_temp)) {
+      corr_plot <- corr_plot + annotate("text", x = w1, y = w2, label = p_mat[w1, w2])
+    }
+  }
+  grid.arrange(tree_plot, corr_plot, ncol = 2,
+               widths = c(0.1,3))
+  dev.off()
+  par(mfrow = c(2,5))
+  done <- c()
+  for (species in 1:length(wasps)) {
+    for (species2 in 1:length(wasps)) {
+      if (!species == species2) {
+        curr_string <- sort(c(wasps[species], wasps[species2]))
+        curr_string <- paste(curr_string, collapse = "_")
+        if (!curr_string %in% done) {
+          done <- c(done, curr_string)
+          corr <- cor.test(depths[, species2], depths[, species],
+                           method = "spearman")
+          plot(depths[, species2] ~ depths[, species],
+               pch = "", xlab = wasps[species],
+               ylab = wasps[species2],
+               main = paste("rho = ", round(corr$estimate, 3),
+                            "; P = ", signif(corr$p.value, 3),
+                            sep = ""),
+               cex.lab = 1.5)
+          cols <- rep("black", length(depths[, species]))
+          if (length(highlight > 0)) {
+            cols[depth_ordered %in% highlight] <- "red"
+          }
+          text(x = depths[, species], y = depths[, species2],
+               labels = circles_clean, col = cols)
+        }
+      }
+    }
+  }
 }
 
 # make a ridgeplot with the posteriors for all the regression coefficients
-plot_posteriors <- function(data, focus, model, outcome, label, baseline, col_by_HIM = FALSE, subtract_for_HIM = FALSE, file_name) {
+plot_posteriors <- function(data, focus, model, outcome, label, baseline, col_by_HIM = FALSE, subtract_for_HIM = FALSE, file_name = NA, pretty_names = NA, cube_root = FALSE) {
   # focus: the variable of interest in this comparison
   if (col_by_HIM == TRUE) {
     data$HIM[data$HIM == "y"] <- "HIM"
@@ -231,6 +224,9 @@ plot_posteriors <- function(data, focus, model, outcome, label, baseline, col_by
   # and clean up the parameter names
   draws <- draws[,str_starts(colnames(draws), paste("b_", focus, sep = ""))]
   categories <- substr(colnames(draws), (nchar(focus) + 3), nchar(colnames(draws)))
+  if (length(pretty_names) > 1) {
+    categories <- pretty_names
+  }
   # make a vector with all the draws for the coefficients
   all_values <- c()
   all_categories <- c()
@@ -254,22 +250,34 @@ plot_posteriors <- function(data, focus, model, outcome, label, baseline, col_by
     all_categories <- c(all_categories, rep(category, length(values)))
     all_categories <- gsub("susceptibilityn", "non-suitable host", all_categories)
   }
-  # get differences for al possibe pairwise comparisons between categories
+  # get differences for all possible pairwise comparisons between categories
   cat_names_all <- c(baseline, categories)
   for (cat in cat_names_all) {
     for (cat2 in cat_names_all) {
       # for the baseline, the prediction comes just from the intercept
       if (cat == baseline) {
         values1 <- exp(intercepts)
+        if (cube_root == TRUE) {
+          values1 <- intercepts ^ 3
+        }
       }
       else {
         values1 <- exp(intercepts + draws[, categories == cat])
+        if (cube_root == TRUE) {
+          values1 <- (intercepts + draws[, categories == cat]) ^ 3
+        }
       }
       if (cat2 == baseline) {
         values2 <- exp(intercepts)
+        if (cube_root == TRUE) {
+          values2 <- intercepts ^ 3
+        }
       }
       else {
         values2 <- exp(intercepts + draws[, categories == cat2])
+        if (cube_root == TRUE) {
+          values2 <- (intercepts + draws[, categories == cat2]) ^ 3
+        }
       }
       diffs <- values1 - values2
       # don't compare a category to itself
@@ -280,11 +288,13 @@ plot_posteriors <- function(data, focus, model, outcome, label, baseline, col_by
         # plot out effect size only if the probability of an effect
         # in either direction is over 80%
         if (prob_above > 0.8 | prob_above < 0.2) {
+          print("*********************")
           print(cat)
+          print(cat2)
           print("Posterior median:")
           print(median(diffs))
           print(paste("95% HPDI for difference compared to", cat2))
-          print(HPDI(diffs, prob = 0.95))
+          print(HPDinterval(as.mcmc(diffs), prob = 0.95))
           print("Prob > 0:")
           print(mean(diffs > 0)) 
         }
@@ -326,22 +336,30 @@ plot_posteriors <- function(data, focus, model, outcome, label, baseline, col_by
   if (col_by_HIM == TRUE) {
     ridgeplot <- ggplot(data_for_plot, aes(x = Outcome, y = !!focus, fill = HIM)) +
       geom_density_ridges_gradient(show.legend = TRUE) +
-      theme_bw() + theme(legend.position = "right") +
+      theme_bw() + theme(legend.position = "right", legend.text = element_text(size=20)) +
       scale_fill_manual(guide = "legend", values=c("HIM"="pink3", "no HIM"="lightblue")) + 
       geom_vline(xintercept = 0) +
-      guides(fill=guide_legend(title="")) + labs(x=outcome)
+      guides(fill=guide_legend(title="")) + labs(x=outcome) +
+      theme(axis.text=element_text(size=20),
+            axis.title=element_text(size=20),
+            axis.title.y = element_blank())
   }
   else {
     ridgeplot <- ggplot(data_for_plot, aes(x = Outcome, y = !!focus, fill = after_stat(x))) +
       geom_density_ridges_gradient() +
       scale_fill_gradient(low = blue, high = red) + theme_bw() +
       theme(legend.position = "none") +
-      geom_vline(xintercept = 0) + labs(x=outcome)
+      geom_vline(xintercept = 0) + labs(x=outcome) +
+      theme(axis.text=element_text(size=20),
+            axis.title=element_text(size=20),
+            axis.title.y = element_blank())
   }
   if (length(categories) < 10) {
-    pdf(file_name, width = 6.2, height = 7)
-    ridgeplot <- ridgeplot + theme(axis.text=element_text(size=14),
-                                   axis.title=element_text(size=14))
+    pdf(file_name, width = 13, height = 7)
+    ridgeplot <- ridgeplot +
+      theme(axis.text=element_text(size=20),
+            axis.title=element_text(size=20),
+            axis.title.y = element_blank())
     if (length(categories) == 5) {
       var_lab_mkd = c("non-suitable host")
       for (i in 1:4) {
@@ -357,107 +375,67 @@ plot_posteriors <- function(data, focus, model, outcome, label, baseline, col_by
   }
   print(ridgeplot)
   dev.off()
+  return(averages)
 }
 
-
-# plot expected means per categorical predictor
-plot_posteriors_stan <- function(model, outcome, variable, baseline, start_pos, file_name, data, height) {
-  # get MCMC draws for the coefficients that correspond to the predictor of 
-  # interest
-  draws <- as.matrix(model)
-  intercepts <- draws[,1]
-  beta_pos <- str_starts(colnames(draws), "beta\\[")
-  cat_names <- colnames(cat_to_num(data[, variable], baseline))
-  cat_names <- gsub("Segment_", "Circle ", cat_names)
-  coefficients <- draws[,beta_pos][, start_pos:(length(cat_names) + start_pos - 1)]
-  # print out HPDIs for the difference between the baseline and each category
-  cat_names_all <- c(baseline, cat_names)
-  for (cat in cat_names_all) {
-    for (cat2 in cat_names_all) {
-      if (cat == baseline) {
-        values1 <- exp(intercepts)
-      }
-      else {
-        values1 <- exp(intercepts + coefficients[, cat_names == cat])
-      }
-      if (cat2 == baseline) {
-        values2 <- exp(intercepts)
-      }
-      else {
-        values2 <- exp(intercepts + coefficients[, cat_names == cat2])
-      }
-      diffs <- values1 - values2
-      if (!cat == cat2) {
-        prob_above <- mean(diffs > 0)
-        if (prob_above > 0.8 | prob_above < 0.2) {
-          print(cat)
-          print("Posterior median:")
-          print(median(diffs))
-          print(paste("95% HPDI for difference compared to", cat2))
-          print(HPDI(diffs, prob = 0.95))
-          print("Prob > 0:")
-          print(mean(diffs > 0)) 
-        }
-      }
-    }
-  }
-  # flatten into vector and set up data for plotting
-  cat_values <- c(coefficients)
-  data_for_plot <- data.frame(Outcome = cat_values)
-  colnames(data_for_plot) <- "Outcome"
-  if (variable == "Segment") {
-    variable <- "Circle"
-  }
-  data_for_plot[, variable] <- rep(cat_names, each = dim(draws)[1])
-  averages <- aggregate(data_for_plot[, "Outcome"] ~ data_for_plot[, variable], FUN = mean)
-  effects <- aggregate(data_for_plot[, "Outcome"] ~ data_for_plot[, variable], FUN = function(x) {mean(x > 0)})
-  print(effects)
-  ordered <- averages[order(averages[,2]),]
-  data_for_plot[,variable] <- factor(data_for_plot[,variable], levels = ordered[,1])
-  variable <- sym(variable)
+# make a ridgeplot with the posteriors for all the regression coefficients
+plot_posteriors_difference <- function(data, focus, model, categories, pretty_names, title) {
+  # set colours
+  trans_red <- rgb(254, 132, 132, maxColorValue = 255, alpha = 10)
+  trans_blue <- rgb(135, 206, 235, maxColorValue = 255, alpha = 10)
   red <- rgb(186, 0, 0, maxColorValue = 255)
   blue <- rgb(115, 186, 215, maxColorValue = 255)
-  # make ridge plot
-  ridgeplot <- ggplot(data_for_plot, aes(x = Outcome, y = !!variable, fill = after_stat(x))) +
-    geom_density_ridges_gradient(show.legend = FALSE) +
-    theme(legend.position = "none") + 
-    scale_fill_gradient(low = blue, high = red) + theme_bw() +
-    ggtitle("") +
-    geom_vline(xintercept = 0) + labs(x=outcome)
-  if (length(cat_names_all) < 10) {
-    ridgeplot <- ridgeplot + theme(axis.text.y=element_text(face="italic"))
+  # get posterior means
+  new_data <- data[1:length(categories),]
+  new_data$hostwasp <- "B. fusca-C. sesamiae kitale"
+  new_data$Segment <- "Segment_35"
+  new_data$depth_cube_root_cpm_scaled <- 0
+  new_data[, focus] <- categories
+  set.seed(99)
+  ped <- posterior_epred(model, newdata = new_data)
+  ped_small <- ped[sample(1:nrow(ped), 1000),]
+  line_colours <- rep(trans_blue, nrow(ped_small))
+  line_colours[ped_small[,2] > ped_small[,1]] <- trans_red
+  par("xpd" = TRUE)
+  vioplot(log10(ped_small), col = c("white", "white"),
+          xaxt = "n", yaxt = "n", ylim = c(-0.5,2.6),
+          main = title, cex.main = 1.3)
+  ticks <- c(0, 10, 100)
+  axis(side = 2, at = log10(ticks + 1), labels = ticks, las = 2,
+       cex.axis = 1.3)
+  mtext("Est. mean # of integrations", side = 2, line = 3,
+        cex = 1.3)
+  text(x = c(0.8,2.2), y = -1.3, labels = pretty_names, srt = 15,
+       cex = 1.3)
+  for (draw in 1:nrow(ped_small)) {
+    lines(log10(ped_small[draw,]) ~ c(1,2), col = line_colours[draw])
   }
-  pdf(file_name, width = 7, height = height)
-  print(ridgeplot)
-  dev.off()  
-  return(ordered)
+  par("xpd" = FALSE)
 }
 
 # plot expected means per categorical predictor + depth
-plot_posteriors_stan_w_depth <- function(model, variable, baseline, start_pos, file_name, data, height, selected, selected_pretty, maximum) {
-  # get MCMC draws for the coefficients that correspond to the predictor of 
-  # interest
-  draws <- as.matrix(model)
-  beta_pos <- str_starts(colnames(draws), "beta\\[")
-  cat_names <- colnames(cat_to_num(data[, variable], baseline))
-  print(sum(beta_pos))
-  coefficients <- draws[,beta_pos][, start_pos:(length(cat_names) + start_pos - 1)]
-  # add in baseline category
-  cat_names <- c(cat_names, baseline)
-  coefficients <- cbind(coefficients, rep(0, nrow(draws)))
-  # get the intercept and the coefficient for depth
-  intercept <- draws[,1]
-  depth_coef <- draws[,2]
-  # generate some corrected depths for the x-axis
-  corr_depths <- seq(0, 350)
+plot_posteriors_w_depth <- function(model, variable, baseline, file_name, data, height, selected, selected_pretty, maximum) {
+  # generate some CPMs for the x-axis
+  corr_depths <- seq(0, 1.3, by = 0.1)
   depth_cube_root <- corr_depths ^ (1/3)
-  pdf(file_name, width = 5, height = height)
+  scale_mean <- mean(data$depth_cube_root_cpm)
+  scale_sd <- sd(data$depth_cube_root_cpm)
+  depth_cube_root_cpm_scaled <- (depth_cube_root - scale_mean)/scale_sd
+  # generate predictions from model
+  new_data <- data[1:(length(selected) * length(depth_cube_root)),]
+  new_data$hostwasp <- "B. fusca-C. sesamiae kitale"
+  new_data$Segment <- "Segment_35"
+  new_data[, variable] <- rep(selected, each = length(depth_cube_root))
+  new_data$depth_cube_root_cpm_scaled <- rep(depth_cube_root_cpm_scaled, 2)
+  ped <- posterior_epred(model, newdata = new_data, re_formula = NA)
+  pdf(file_name, width = 4, height = 4)
   plot(seq(0, maximum, length.out = length(depth_cube_root)) ~ depth_cube_root,
-       pch = "", main = "", xlab = "Corrected depth", 
+       pch = "", main = "", xlab = "Corrected DPM", 
        ylab = "Est. mean # of integrations",
        las = 2, xaxt = "n")
-  labels <- c(0, 10, 100, 300)
-  axis(side = 1, at = labels ^ (1/3), labels = labels,
+  labels <- c(0, 0.01, 0.05, 0.2, 0.5, 1)
+  labels_loc <- labels ^ (1/3)
+  axis(side = 1, at = labels_loc, labels = labels,
        las = 2)
   trans_red <- rgb(254, 132, 132, maxColorValue = 255, alpha = 10)
   trans_blue <- rgb(135, 206, 235, maxColorValue = 255, alpha = 10)
@@ -465,14 +443,14 @@ plot_posteriors_stan_w_depth <- function(model, variable, baseline, start_pos, f
   blue <- rgb(115, 186, 215, maxColorValue = 255)
   cols = c(trans_red, trans_blue)
   cols_dark = c(red, blue)
-  selected_iter <- sample(1:nrow(draws), 1000)
+  selected_iter <- sample(1:nrow(ped), 1000)
   for (cat in 1:length(selected)) {
     for (iter in selected_iter) {
-      pred_means <- exp(intercept[iter] + depth_coef[iter] * depth_cube_root + coefficients[iter, cat_names == selected[cat]])
-      lines(pred_means ~ depth_cube_root,
+      lines(ped[iter, new_data[, variable] == selected[cat]] ~ depth_cube_root,
             col = cols[cat])
     }
-    pred_means_across_draws <- exp(median(intercept) + median(depth_coef) * depth_cube_root + median(coefficients[iter, cat_names == selected[cat]]))
+    pred_means_across_draws <- apply(ped[selected_iter, new_data[, variable] == selected[cat]],
+                                     MAR = 2, FUN = median)
     lines(pred_means_across_draws ~ depth_cube_root,
           col = cols_dark[cat], lwd = 2)
   }
@@ -482,8 +460,7 @@ plot_posteriors_stan_w_depth <- function(model, variable, baseline, start_pos, f
   return()
 }
 
-
-# visualise posterior predictions as a function of depth
+# visualise posterior predictions as a function of a numerical variable of interest
 plot_ppd <- function(ppd, draw_number, data, outcome, predictor, xlab, ylab, logged = FALSE, plot_medians = FALSE) {
   # sample the desired number of draws from the PPD
   ppd_plotting <- ppd[sample(1:dim(ppd)[1], draw_number, replace = FALSE),]
@@ -505,7 +482,7 @@ plot_ppd <- function(ppd, draw_number, data, outcome, predictor, xlab, ylab, log
     ticks <- log10(c(1, 11, 101, 1001))
     axis(side = 2, at = ticks, labels = c(0, 10, 100, 1000),
          las = 2)
-    labels <- c(0, 10, 100, 300)
+    labels <- c(0, 0.01, 0.05, 0.2, 0.5, 1)
     axis(side = 1, at = labels ^ (1/3), labels = labels,
          las = 2)
     points(log10(data[, outcome] + 1) ~ data[, predictor],
@@ -523,10 +500,10 @@ plot_ppd <- function(ppd, draw_number, data, outcome, predictor, xlab, ylab, log
     if (plot_medians == TRUE) {
       all_pred_round <- round(all_pred, digits = 1)
       simulated <- aggregate(all_outcome ~ all_pred_round, FUN = mean)
-      real <- aggregate(data$depth_cube_root ~ round(data$log.host_BUSCO_depth, digits = 1), FUN = mean)
+      real <- aggregate(data$depth_cube_root_cpm ~ round(data$log.host_BUSCO_depth, digits = 1), FUN = mean)
       plot(real[,2] ~ real[,1],
            type = "l", col = "steelblue3", lwd = 2, xlab = "log host BUSCO depth",
-           ylab = "Corrected depth", yaxt = "n")
+           ylab = "Corrected CPM", yaxt = "n")
       lines(simulated[,2] ~ simulated[,1],
             col = "black", lwd = 2)
       labels <- c(0, 10, 100, 300)
@@ -535,14 +512,15 @@ plot_ppd <- function(ppd, draw_number, data, outcome, predictor, xlab, ylab, log
       legend("bottomright", legend = c("Observed data", "Posterior predictions"),
              lwd = 2, col = c("black", "steelblue3"), bty = "n")
     } else {
-      smoothScatter(all_outcome ~ all_pred, nrpoints = 0,
+      smoothScatter(log10(all_outcome) ~ all_pred, nrpoints = 0,
                     nbin = 500, ylab = ylab,
                     xlab = xlab,
+                    las = 2, xlim = c(0, max(data[, predictor])),
                     yaxt = "n")
-      labels <- c(0, 10, 100, 300)
-      axis(side = 2, at = labels ^ (1/3), labels = labels,
-           las = 2)
-      points(data[, outcome] ~ data[, predictor],
+      labels <- c(0, 10, 100)
+      axis(side = 2, at = log10(labels + 1), labels = labels,
+      las = 2)
+      points(log10(data[, outcome]) ~ data[, predictor],
              pch = 20, col = "black")  
     }
   }
@@ -609,13 +587,13 @@ plot_ppd_by_segment <- function(ppd, draw_number, data, outcome, ylab, logged = 
 }
 
 # plot the true value of a (simulated) parameter,
-# as well as the 95% HPDI from Stan
+# as well as the 95% HPDI from brms
 plot_true_with_estimated <- function(one_sim, positions, cols, labels, with_depth_only = FALSE,
                                      xlab = "Parameter value") {
   lows <- one_sim$HPDI_depth[1, positions]
   highs <- one_sim$HPDI_depth[2, positions]
   positions_no_depth <- positions
-  positions_no_depth[positions_no_depth > 2] <- positions_no_depth[positions_no_depth > 2] - 1
+  positions_no_depth <- positions_no_depth - 1
   lows_no_depth <- one_sim$HPDI_no_depth[1, positions_no_depth]
   highs_no_depth <- one_sim$HPDI_no_depth[2, positions_no_depth]
   trues <- one_sim$real_values[positions]
@@ -624,14 +602,14 @@ plot_true_with_estimated <- function(one_sim, positions, cols, labels, with_dept
   maximum <- max(highs, lows, trues, highs_no_depth, lows_no_depth)
   if (with_depth_only == TRUE) {
     default <- par("mar")
-    par("mar" = c(5.1, 6.1, 4.1, 2.1))
+    par("mar" = c(5.1, 7.1, 4.1, 2.1))
     par("xpd" = TRUE)
     plot(y ~ highs, pch = "", xlim = c(minimum, maximum),
          main = "", yaxt = "n",
          ylab = "",
          xlab = xlab, cex.lab = 0.75, 
          cex.axis = 0.75)
-    text(x = -4, y = y,
+    text(x = -2.8, y = y,
          labels = labels, cex = 0.75)
     par("xpd" = FALSE)
     abline(v = 0, lty = 3, col = "grey", lwd = 2)
@@ -641,14 +619,14 @@ plot_true_with_estimated <- function(one_sim, positions, cols, labels, with_dept
   } 
   else {    
     default <- par("mar")
-    par("mar" = c(5.1, 6.1, 4.1, 2.1))
+    par("mar" = c(5.1, 7.1, 4.1, 2.1))
     par("xpd" = TRUE)
     plot(y ~ highs_no_depth, pch = "", xlim = c(minimum, maximum),
          main = "", yaxt = "n",
          ylab = "",
          xlab = xlab, cex.lab = 0.75, 
          cex.axis = 0.75)
-    text(x = -4, y = y,
+    text(x = -2.8, y = y,
          labels = labels, cex = 0.75)
     par("xpd" = FALSE)
     abline(v = 0, lty = 3, col = "grey", lwd = 2)
@@ -658,141 +636,10 @@ plot_true_with_estimated <- function(one_sim, positions, cols, labels, with_dept
   }
 }
 
-# plot out the probability of failed oviposition as 
-# a function of wasp + host depth
-plot_zi_stan <- function(model, int_data, main) {
-  # calculate combined (wasp + host) depth per sample
-  comb_depth_raw <- int_data$depth + int_data$wasp_BUSCO_depth
-  combined_depth <- aggregate(comb_depth_raw ~ int_data$sample, FUN = median)[,2]
-  # get the MCMC draws corresponding to thetas
-  draws <- as.matrix(model)
-  theta_pos <- str_starts(colnames(draws), "theta")
-  theta <- draws[, theta_pos]
-  # average the thetas across MCMC draws
-  fitted_zi <- colMeans(theta)
-  # calculate upper and lower boundary
-  # for 95% HPDI
-  lower <- c()
-  upper <- c()
-  for (column in 1:dim(theta)[2]) {
-    curr <- HPDI(theta[,column], prob = 0.95)
-    lower <- c(lower, curr[1])
-    upper <- c(upper, curr[2])
-  }
-  # make pretty plot
-  plot(fitted_zi[order(combined_depth)] ~ combined_depth[order(combined_depth)], 
-       type = "l", col = "black",
-       lwd = 2, xlab = "Depth + wasp depth", 
-       ylab = "Probability of failed oviposition",
-       xlim = c(0,50), main = main, ylim = c(0, 1))
-  lines(lower[order(combined_depth)] ~ combined_depth[order(combined_depth)], 
-        col = "black",
-        lwd = 1, lty = 2)
-  lines(upper[order(combined_depth)] ~ combined_depth[order(combined_depth)], 
-        col = "black",
-        lwd = 1, lty = 2)
-}
-
-# model the number of integrations in Stan
-run_stan_model <- function(int_data, host_sus = TRUE, weak_prior = FALSE, iter = 2000, no_depth = FALSE, show_all_parameters = FALSE, silent = FALSE, weak_prior_coefficients = FALSE) {
-  int_data$sample <- factor(int_data$sample, levels = sort(unique(int_data$sample)))
-  # create combined depth variable for modelling the probability of failed oviposition
-  comb_depth <- scale(log(int_data$depth + int_data$wasp_BUSCO_depth))
-  # average it per sample
-  depth_per_sample <- aggregate(comb_depth ~ int_data$sample, FUN = mean)
-  # create input data matrix for Stan
-  depth_only <- as.matrix(scale(int_data$norm_depth1^(1/3)))
-  colnames(depth_only) <- "depth"
-  X <- cbind(depth_only, cat_to_num(int_data$Segment, "Segment_35"),
-             cat_to_num(int_data$host, "S. calamistis"),
-             cat_to_num(int_data$wasp, "C. sesamiae kitale"))
-  if (no_depth == TRUE) {
-    X <- cbind(cat_to_num(int_data$Segment, "Segment_35"),
-               cat_to_num(int_data$host, "S. calamistis"),
-               cat_to_num(int_data$wasp, "C. sesamiae kitale"))
-  }
-  if (host_sus == TRUE) {
-    X <- cbind(X, cat_to_num(int_data$host_susceptibility, "y"))
-    colnames(X)[length(colnames(X))] <- "host_susceptibility"
-  }
-  # priors for modelling the probability of failed oviposition
-  zi_mean = -1.31
-  zi_sd = 1
-  if (weak_prior == TRUE) {
-    zi_mean = 0
-    zi_sd = 5    
-  }
-  b_sd <- 1
-  if (weak_prior_coefficients == TRUE) {
-    b_sd = 10
-  }
-  # all data for model
-  model_in <- list(N = dim(int_data)[1], 
-                   y = int_data$int,
-                   X = X,
-                   K = dim(X)[2],
-                   S = length(unique(int_data$sample)),
-                   s = as.integer(int_data$sample),
-                   d = depth_per_sample[,2],
-                   zi_mean = zi_mean,
-                   zi_sd = zi_sd,
-                   b_sd = b_sd)
-  # fit model
-  if (silent == TRUE) {
-    zinb_stan <- stan("zinb.stan", data = model_in, iter = iter, 
-                      warmup = 1000, chains = 4, cores = 4,
-                      refresh = -1, seed = 31)    
-  }
-  else {
-    zinb_stan <- stan("zinb.stan", data = model_in, iter = iter, 
-                      warmup = 1000, chains = 4, cores = 4, seed = 31)     
-  }
-  # check convergence and ESS
-  stan_est <- extract(zinb_stan, permuted = FALSE)
-  rhats <- c()
-  ess_b <- c()
-  ess_t <- c()
-  for (parameter in 1:dim(stan_est)[3]) {
-    curr_draws <- matrix(stan_est[,,parameter], ncol = 4)
-    rhats <- c(rhats, Rhat(curr_draws))
-    ess_b <- c(ess_b, ess_bulk(curr_draws))
-    ess_t <- c(ess_t, ess_tail(curr_draws))
-  }
-  print("Maximum Rhat:")
-  print(max(rhats))
-  print("Minimum ESS:")
-  print(min(c(ess_b, ess_t)))
-  print(traceplot(zinb_stan))
-  # look at Rhats/ESS parameter by parameter
-  if (show_all_parameters == TRUE) {
-    print("Rhats")
-    names(rhats) <- dimnames(stan_est)$parameters
-    print(rhats)
-    print("ESS bulk")
-    names(ess_b) <- dimnames(stan_est)$parameters
-    print(ess_b)
-    print("ESS tail")
-    names(ess_t) <- dimnames(stan_est)$parameters
-    print(ess_t)
-  }
-  return(zinb_stan)
-}
-
-# plot out the random effects for sample
-show_random_effects <- function(model, int_data) {
-  draws <- as.matrix(model)
-  alpha_pos <- str_starts(colnames(draws), "alpha\\[")
-  alphas <- draws[, alpha_pos]
-  vioplot(alphas, names = levels(int_data$sample), las = 2,
-          col = "lightpink", main = "Sample effects", 
-          ylab = "Deviation from baseline\n")
-  abline(h = 0, lwd = 1.5, lty = 3)  
-}
-
 # given a categorical variable, set coefficients to 0 for all
 # except for predefined categories, which will get a pre-defined coefficient
 simulate_coefficients <- function(variable, to_modify, value_to_set_to, int_data_sim, baseline) {
-  values <- unique(int_data_sim[, variable])
+  values <- levels(int_data_sim[, variable])
   coefs <- rep(0, dim(int_data_sim)[1])
   coefs_unique <- rep(0, length(values))
   for (cat in to_modify) {
@@ -806,73 +653,62 @@ simulate_coefficients <- function(variable, to_modify, value_to_set_to, int_data
 # make a simulated data set and see if depth is controlled for appropriately
 simulate_data <- function(indata, seed, all_visuals = FALSE, weak_prior = FALSE) {
   set.seed(seed)
+  # make sure the dodgy sample has been removed
+  indata <- indata[indata$sample != "FAW6",]
+  # based on posterior median in negative binomial model
+  re_sigma <- 0.79
   int_data_sim <- indata
   sample_names <- levels(int_data_sim$sample)
+  log_cpm <- log(indata$cpm)
+  indata$log_cpm <- log_cpm
   # pick a value to use as the baseline depth
-  mean_depth <- mean(log(indata$depth[indata$depth > 0]))
+  mean_depth <- mean(indata$log_cpm[indata$cpm != 0])
   means <- rep(mean_depth, dim(int_data_sim)[1])
   # increase or decrease depth for certain Segments/hosts/wasps
-  coefs <- simulate_coefficients("Segment", c(3, 6, 9), 2, int_data_sim, "Segment_35")[["coefs"]]
+  coefs <- simulate_coefficients("Segment", c(4, 7, 10), 0.5, int_data_sim, "Segment_35")[["coefs"]]
   means <- means + coefs
-  coefs <- simulate_coefficients("host", 2, 2, int_data_sim, "S. calamistis")[["coefs"]]
-  means <- means + coefs
-  coefs <- simulate_coefficients("wasp", 3, -3, int_data_sim, "C. sesamiae kitale")[["coefs"]]
+  coefs <- simulate_coefficients("hostwasp", c(4), 0.5, int_data_sim, "B. fusca-C. sesamiae kitale")[["coefs"]]
   means <- means + coefs
   # sample random values from around these means
-  sigma <- sd(log(indata[indata$host == "C. partellus",]$depth))
-  sim_depths <- rnorm(dim(int_data_sim)[1], mean = means, sd = sigma)
-  # convert from log to original scale
-  int_data_sim$depth <- exp(sim_depths)
+  std <- sd(indata$log_cpm[indata$cpm != 0])
+  sim_depths <- rnorm(dim(int_data_sim)[1], mean = means, sd = std)
+  int_data_sim$cpm <- exp(sim_depths)
+  # take cube root
+  int_data_sim$depth_cube_root_cpm <- int_data_sim$cpm ^ (1/3)
+  # check that simulated depths look reasonable and show
+  # the specified effects
   if (all_visuals == TRUE) {
     default <- par("mar")
     par(mfrow = c(1,1))
     par("mar" = c(7.1, 4.1, 4.1, 2.1))
-    vioplot(depth ~ host, cex.axis = 0.7, col = "lightyellow",
+    vioplot(depth_cube_root_cpm ~ hostwasp, cex.axis = 0.7, col = "lightyellow",
             ylab = "Depth", xlab = "", las = 2, data = int_data_sim)
-    vioplot(depth ~ Segment, cex.axis = 0.7, col = "lightyellow",
+    vioplot(depth_cube_root_cpm ~ Segment, cex.axis = 0.7, col = "lightyellow",
             ylab = "Depth", xlab = "", las = 2, data = int_data_sim)
     par("mar" = c(9.1, 4.1, 4.1, 2.1))
-    vioplot(depth ~ wasp, cex.axis = 0.7, col = "lightyellow",
-            ylab = "Depth", xlab = "", las = 2, data = int_data_sim)
     par("mar" = default)  
-    plot(density(log(indata[indata$host == "C. partellus",]$depth)), main = "", xlab = "ln Depth",
+    plot(density(log(indata[indata$host == "C. partellus",]$depth_cube_root_cpm)), main = "", xlab = "ln Depth",
          col = "skyblue",
          lwd = 2)
-    lines(density(log(indata$depth)), col = "steelblue", lwd = 2)
+    lines(density(log(indata$depth_cube_root_cpm)), col = "steelblue", lwd = 2)
     legend("topright", legend = c("observed", "simulated"), col = c("skyblue", "steelblue"),
            lwd = 2)
   }
-  # model relationship between depth and wasp depth
-  # simulate new normalised depths
-  model_wd <- lm(log(wasp_BUSCO_depth) ~ log(depth), data = indata[indata$host == "C. partellus",])
-  int_data_sim$wasp_BUSCO_depth <- exp(rnorm(dim(int_data_sim)[1], 
-                                             mean = model_wd$coefficients[1] + log(int_data_sim$depth) * model_wd$coefficients[2],
-                                             sd = sigma(model_wd)))
-  int_data_sim$norm_depth1 <- int_data_sim$depth - int_data_sim$wasp_BUSCO_depth
-  int_data_sim$norm_depth1[int_data_sim$norm_depth1 < 0] <- 0
-  int_data_sim$depth_cube_root <- int_data_sim$norm_depth1 ^ (1/3)
   # model the number of integrations as a function of depth
   # simulate new numbers of integrations
-  model_int <- brm(int ~ scale(depth_cube_root), data = int_data,
-                   family = negbinomial(), iter = 500, silent = 2, refresh = 0)
-  draws <- as.matrix(model_int)
-  intercept <- median(draws[,1])
-  means <- intercept + scale(int_data_sim$depth_cube_root) * median(draws[,2])
-  betas <- c(median(draws[,2]))
-  coefs_segment <- simulate_coefficients("Segment", c(1,2), 1, int_data_sim, "Segment_35")
+  model_int <- glm.nb(int ~ depth_cube_root_cpm, data = indata)
+  intercept <- coef(model_int)[1]
+  means <- intercept + (int_data_sim$depth_cube_root_cpm * coef(model_int)[2])
+  betas <- c(coef(model_int)[2])
+  # shift the number of integrations based on predictor values
+  # (i.e. simulate effects)
+  coefs_segment <- simulate_coefficients("Segment", c(2,3), 1, int_data_sim, "Segment_35")
   betas <- c(betas, coefs_segment[["coefs_unique"]])
   means <- means + coefs_segment[["coefs"]]
-  coefs_host <- simulate_coefficients("host", c(5), -1, int_data_sim, "S. calamistis")
+  coefs_host <- simulate_coefficients("hostwasp", c(5), 1, int_data_sim, "B. fusca-C. sesamiae kitale")
   betas <- c(betas, coefs_host[["coefs_unique"]])
   means <- means + coefs_host[["coefs"]]
-  coefs_wasp <- simulate_coefficients("wasp", c(3), 1, int_data_sim, "C. sesamiae kitale")
-  betas <- c(betas, coefs_wasp[["coefs_unique"]])
-  means <- means + coefs_wasp[["coefs"]]
-  coefs_host_sus <- simulate_coefficients("host_susceptibility", c(2), -2, int_data_sim, "y")
-  means <- means + coefs_host_sus[["coefs"]]
-  betas <- c(betas, coefs_host_sus[["coefs_unique"]])
   # simulate sample-level random effects
-  re_sigma <- rgamma(1, 1, 3)
   alphas <- rnorm(length(sample_names), mean = 0, sd = re_sigma)
   counter <- 1
   for (s in sample_names) {
@@ -880,56 +716,68 @@ simulate_data <- function(indata, seed, all_visuals = FALSE, weak_prior = FALSE)
     counter <- counter + 1
   }
   # simulate numbers of integrations
-  phi <- median(draws[,3])
+  phi <- model_int$theta
   int_data_sim$int <- rnbinom(dim(int_data_sim)[1], 
                               mu = exp(means),
                               size = phi)
-  # simulate the zero-inflated component
-  sad_wasps <- c("FAW5")
-  int_data_sim$depth[int_data_sim$sample %in% sad_wasps] <- rexp(length(int_data_sim$depth[int_data_sim$sample %in% sad_wasps]), rate = 100)
-  int_data_sim$wasp_BUSCO_depth[int_data_sim$sample %in% sad_wasps] <- rexp(length(int_data_sim$wasp_BUSCO_depth[int_data_sim$sample %in% sad_wasps]), rate = 100)
-  # to make sure normalised depth is correct for FAW5 too
-  int_data_sim$norm_depth1 <- int_data_sim$depth - int_data_sim$wasp_BUSCO_depth
-  int_data_sim$norm_depth1[int_data_sim$norm_depth1 < 0] <- 0
-  int_data_sim$depth_cube_root <- int_data_sim$norm_depth1 ^ (1/3)
-  int_data_sim$int[int_data_sim$sample %in% sad_wasps] <- 0
   # run model either controlling for depth or not controlling for it
-  no_depth_model <- run_stan_model(int_data_sim, host_sus = TRUE, iter = 2000, no_depth = TRUE, silent = TRUE, weak_prior_coefficients = weak_prior)
-  depth_model <- run_stan_model(int_data_sim, host_sus = TRUE, iter = 2000, no_depth = FALSE, silent = TRUE, weak_prior_coefficients = weak_prior)
+  prior_b0 <- set_prior("normal(0,3)", class = "Intercept")
+  prior_b <- set_prior("normal(0,2)", class = "b")
+  prior_sd <- set_prior("normal(0,5)", class = "sd")
+  prior_shape <- set_prior("inv_gamma(0.4, 0.3)", class = "shape")
+  priors <- c(prior_b0, prior_b, prior_sd, prior_shape)
+  depth_model <- brm(int ~ depth_cube_root_cpm + Segment + hostwasp + (1|sample),
+                   data = int_data_sim, family = negbinomial(),
+                   prior = priors, cores = 4, iter = 500, 
+                   warmup = 250, silent = 2, refresh = 0)
+  no_depth_model <- brm(int ~ Segment + hostwasp + (1|sample),
+                     data = int_data_sim, family = negbinomial(),
+                     prior = priors, cores = 4, iter = 500, 
+                     warmup = 250, silent = 2, refresh = 0)
   if (all_visuals == TRUE) {
+    print(summary(depth_model))
     par(mfrow = c(1,2))
-    plot(log(int + 1) ~ depth_cube_root, data = indata)
-    plot(log(int + 1) ~ depth_cube_root, data = int_data_sim) 
-    print(cor.test(log(indata$int + 1), indata$depth_cube_root))
-    print(cor.test(log(int_data_sim$int + 1), int_data_sim$depth_cube_root))
+    plot(log(int + 1) ~ depth_cube_root_cpm, data = indata,
+         main = "Observed")
+    plot(log(int + 1) ~ depth_cube_root_cpm, data = int_data_sim,
+         main = "Simulated") 
+    print(cor.test(log(indata$int + 1), indata$depth_cube_root_cpm))
+    print(cor.test(log(int_data_sim$int + 1), int_data_sim$depth_cube_root_cpm))
   }
   # store various statistics
   draws_no_depth <- as.matrix(no_depth_model)
   draws_depth <- as.matrix(depth_model)
-  stat_names <- c("intercept", 
-                  rep("beta", length(betas)),
-                  "rphi",
-                  rep("alpha", length(alphas)),
-                  "sigma_re")
-  stat_names_no_depth <- stat_names[-2]
+  stat_names <- c(colnames(draws_depth)[startsWith(colnames(draws_depth), "b_")],
+                  "shape",
+                  colnames(draws_depth)[startsWith(colnames(draws_depth), "r_sample")],
+                  "sd_sample__Intercept")
+  stat_names_no_depth <- c(colnames(draws_no_depth)[startsWith(colnames(draws_no_depth), "b_")],
+                           "shape",
+                           colnames(draws_no_depth)[startsWith(colnames(draws_no_depth), "r_sample")],
+                           "sd_sample__Intercept")
   real_values <- c(intercept,
                    betas,
-                   1/phi,
+                   phi,
                    alphas,
                    re_sigma)
-  sad_wasps_no_depth <- apply(draws_no_depth[, 389:409], 2, median)[sample_names %in% sad_wasps]
-  sad_wasps_depth <- apply(draws_depth[, 390:410], 2, median)[sample_names %in% sad_wasps]
-  posterior_medians_no_depth <- apply(draws_no_depth[, 1:length(stat_names_no_depth)], 2, median)
-  posterior_medians_depth <- apply(draws_depth[, 1:length(stat_names)], 2, median)
-  HPDI_no_depth <- apply(draws_no_depth[, 1:length(stat_names_no_depth)], 2, FUN = function(x) {HPDI(x, prob = 0.95)})
-  HPDI_depth <- apply(draws_depth[, 1:length(stat_names)], 2, FUN = function(x) {HPDI(x, prob = 0.95)})
-  above0 <- apply(draws_depth, 2, FUN = function(x) {mean(x > 0)})
-  above0_no_depth <- apply(draws_no_depth, 2, FUN = function(x) {mean(x > 0)})
+  posterior_medians_no_depth <- apply(draws_no_depth[, stat_names_no_depth], 2, median)
+  posterior_medians_depth <- apply(draws_depth[, stat_names], 2, median)
+  HPDI_no_depth <- apply(draws_no_depth[, stat_names_no_depth], 2, FUN = function(x) {HPDinterval(as.mcmc(x), prob = 0.95)})
+  HPDI_depth <- apply(draws_depth[, stat_names], 2, FUN = function(x) {HPDinterval(as.mcmc(x), prob = 0.95)})
+  above0 <- apply(draws_depth[, stat_names], 2, FUN = function(x) {mean(x > 0)})
+  above0_no_depth <- apply(draws_no_depth[, stat_names_no_depth], 2, FUN = function(x) {mean(x > 0)})
+  if (all_visuals == TRUE) {
+    for (param in 1:length(stat_names)) {
+      print("*****")
+      print(stat_names[param])
+      print(real_values[param])
+      print(HPDI_depth[, param])
+      print(above0[param])
+    }
+  }
   return(list("stat_names" = stat_names,
               "stat_names_no_depth" = stat_names_no_depth,
               "real_values" = real_values,
-              "sad_wasps_no_depth" = sad_wasps_no_depth,
-              "sad_wasps_depth" = sad_wasps_depth,
               "posterior_medians_no_depth" = posterior_medians_no_depth,
               "posterior_medians_depth" = posterior_medians_depth,
               "HPDI_no_depth" = HPDI_no_depth,
@@ -947,20 +795,16 @@ simulate_data_wrapper <- function(int_data, sim_number, seed, weak_prior = FALSE
   # columns
   # make two versions of it, one for the model that controls for depth
   # and one for the model that doesn't
-  captured <- matrix(0L, nrow = sim_number, ncol = 49)
-  captured_no_depth <- matrix(0L, nrow = sim_number, ncol = 49)
-  # vectors for whether or not the zero-inflated component
-  # is working properly
-  sad_wasps <- rep(0, sim_number)
-  sad_wasps_no_depth <- rep(0, sim_number)
-  # also create matrices to store the probability of each estimate 
+  captured <- matrix(0L, nrow = sim_number, ncol = 46)
+  captured_no_depth <- matrix(0L, nrow = sim_number, ncol = 46)
+  # create matrices to store the probability of each estimate 
   # being above 0 for each parameter
   # this is useful to check that depth is controlled for successfully
-  above0 <- matrix(0L, nrow = sim_number, ncol = 49)
-  above0_no_depth <- matrix(0L, nrow = sim_number, ncol = 49)
+  above0 <- matrix(0L, nrow = sim_number, ncol = 46)
+  above0_no_depth <- matrix(0L, nrow = sim_number, ncol = 46)
   # and posterior medians
-  post_medians <- matrix(0L, nrow = sim_number, ncol = 49)
-  post_medians_no_depth <- matrix(0L, nrow = sim_number, ncol = 49)
+  post_medians <- matrix(0L, nrow = sim_number, ncol = 46)
+  post_medians_no_depth <- matrix(0L, nrow = sim_number, ncol = 46)
   for (sim in 1:sim_number) {
     print("Simulation:")
     print(sim)
@@ -969,10 +813,8 @@ simulate_data_wrapper <- function(int_data, sim_number, seed, weak_prior = FALSE
     out <- simulate_data(int_data, seed + sim, FALSE, weak_prior = weak_prior)
     options(warn = 0)
     # check if the sad wasps were detected
-    sad_wasps[sim] <- out$sad_wasps_depth
-    sad_wasps_no_depth[sim] <- out$sad_wasps_no_depth
     # fill in the corresponding rows of the output matrices
-    for (param in 1:49) {
+    for (param in 1:46) {
       captured[sim, param] <- out$real_values[param] > out$HPDI_depth[1, param] & out$real_values[param] < out$HPDI_depth[2, param] 
       above0[sim, param] <- out$above0[param]
       post_medians[sim, param] <- out$posterior_medians_depth[param]
@@ -988,90 +830,20 @@ simulate_data_wrapper <- function(int_data, sim_number, seed, weak_prior = FALSE
           post_medians_no_depth[sim, param] <- out$posterior_medians_no_depth[param - 1]
         }
       }
-    }   
-    # every 10 simulations, make a plot to compare true and estimated
-    # parameter values
-    if (sim %% 10 == 0) {
-      colours <- c("red2", rep("skyblue", sum(out$stat_names == "beta")),
-                   "black", rep("pink", sum(out$stat_names == "alpha")),
-                   "coral1") 
-      par(mfrow = c(1,2))
-      plot(out[["posterior_medians_depth"]] ~ out[["real_values"]],
-           col = colours, pch = 20,
-           xlab = "Real",
-           ylab = "Estimated",
-           main = "Controlling for depth")
-      abline(a = 0, b = 1, col = "gray", lwd = 2)
-      legend("topleft", col = unique(colours), legend = unique(out$stat_names),
-             pch = 20)
-      plot(out[["posterior_medians_no_depth"]] ~ out[["real_values"]][-2],
-           col = colours[-2], pch = 20,
-           xlab = "Real",
-           ylab = "Estimated",
-           main = "Not controlling for depth")
-      abline(a = 0, b = 1, col = "gray", lwd = 2)
-      legend("topleft", col = unique(colours), legend = unique(out$stat_names),
-             pch = 20)
     }
   }
   return(list("captured" = captured, "captured_no_depth" = captured_no_depth,
-              "above0" = above0, "above0_no_depth" = above0_no_depth))
+              "above0" = above0, "above0_no_depth" = above0_no_depth,
+              "post_medians" = post_medians, 
+              "post_medians_no_depth" = post_medians_no_depth))
 }
-
-# obtain posterior predictive distribution and visualise either by depth 
-# (alternative visualisation to earlier)
-# or by segment ID
-zinb_ppd <- function(model, int_data, draw_number, plot_by_depth = FALSE, plot_by_segment = FALSE) {
-  # extract MCMC draws
-  draws <- as.matrix(model)
-  # get columns corresponding to the probability of failed oviposition
-  theta_pos <- str_starts(colnames(draws), "theta")
-  theta <- draws[, theta_pos]
-  colnames(theta) <- levels(int_data$sample)
-  # get columns corresponding to the mean number of integrations
-  mu_pos <- str_starts(colnames(draws), "mu\\[")
-  mus <- draws[, mu_pos]
-  # prepare matrix of 0s that will get filled in by the PPD
-  ppd <- matrix(rep(0, dim(mus)[1] * dim(mus)[2]), ncol = dim(mus)[2])
-  # loop over the MCMC draws
-  for (obs in 1:dim(ppd)[2]) {
-    # determine current sample and get corresponding theta
-    curr_sample <- int_data[obs, "sample"]
-    theta_column <- theta[, colnames(theta) == curr_sample]
-    for (draw in 1:dim(ppd)[1]) {
-      # based on theta, either set the number of integrations to 0
-      # or sample from negative binomial distribution
-      select <- sample(c(0, 1), 1, prob = c(theta_column[draw], 1 - theta_column[draw]))
-      if (select == 0) {
-        sim_value <- 0
-      } 
-      else {
-        sim_value <- rnbinom(1, mu = mus[draw, obs], size = draws[draw, "phi"])
-      }
-      ppd[draw, obs] <- sim_value
-    }
-  }
-  # visualise ppd as a function of depth
-  if (plot_by_depth == TRUE) {
-    plot_ppd(ppd, draw_number, int_data, "int", "depth_cube_root", 
-             "Corrected depth", "# of integrations", 
-             logged = TRUE)    
-  }
-  # visualise ppd as a function of segment
-  if (plot_by_segment == TRUE) {
-    plot_ppd_by_segment(ppd, draw_number, int_data, "int", 
-                        "log(# of integrations + 1)", 
-                        logged = TRUE)    
-  }
-  return(ppd)
-} 
 
 ######
 
 # Read in and clean data
 ######
-int_data <- read.csv("chimera_depth_Bayes.txt", sep = "\t")
-ls_data <- read.csv("depth_nb_reads.txt", sep = "\t") # nb_read is the library size 
+int_data <- read.csv("chimera_depth_Bayes_18_03_25.txt", sep = "\t")
+ls_data <- read.csv("depth_nb_reads_30.05.txt", sep = "\t")
 # extract library size data and tack it on as an extra column in
 # the main data frame
 ls <- c()
@@ -1079,6 +851,8 @@ for (line in 1:dim(int_data)[1]) {
   ls <- c(ls, ls_data$nb_reads[ls_data$sample == int_data[line, 2]])
 }
 int_data$library_size <- ls
+# initial file had incorrect library size
+int_data$library_size[int_data$sample == "a1"] <- 352004484
 
 # clean data
 
@@ -1089,6 +863,7 @@ int_data$int <- as.integer(round(int_data$int))
 int_data[int_data$Segment == "Segment_20/33", "Segment"] <- "Segment_20_33"
 segment_names <- unique(int_data$Segment)
 int_data$Segment = factor(int_data$Segment, levels = segment_names)
+# give prettier names to the wasps
 original_wasps <- unique(int_data$wasp)
 new <- c("C. sesamiae kitale",
          "C. sesamiae mombasa",
@@ -1099,6 +874,7 @@ for (wasp in 1:length(original_wasps)) {
   int_data$wasp[int_data$wasp == original_wasps[wasp]] <- new[wasp]
 }
 int_data$wasp = factor(int_data$wasp, levels = new)
+# give prettier names to hosts
 original <- unique(int_data$host)
 new <- c("B. fusca",
          "S. calamistis",
@@ -1125,10 +901,78 @@ int_data$norm_depth1[int_data$norm_depth1 < 0] <- 0
 # do the same for the data frame that has circles with no HIM
 int_data_w_HIM$norm_depth1 <- int_data_w_HIM$depth - int_data_w_HIM$wasp_BUSCO_depth
 int_data_w_HIM$norm_depth1[int_data_w_HIM$norm_depth1 < 0] <- 0
+# make a new variable that combines the host and wasp
+# information
+int_data$hostwasp <- paste(int_data$host, int_data$wasp, sep = "-")
+int_data_w_HIM$hostwasp <- paste(int_data_w_HIM$host, int_data_w_HIM$wasp, sep = "-")
+
+# making sure that the first level is always the correct
+# baseline for factors
+other_levels <- unique(as.character(int_data$Segment))
+other_levels <- other_levels[other_levels != "Segment_35"]
+int_data$Segment <- factor(int_data$Segment, 
+                                 levels = c("Segment_35", other_levels))
+other_levels <- unique(as.character(int_data$host))
+other_levels <- other_levels[other_levels != "S. calamistis"]
+int_data$host <- factor(int_data$host, levels = c("S. calamistis", 
+                                                              other_levels))
+other_levels <- unique(as.character(int_data$wasp))
+other_levels <- other_levels[other_levels != "C. sesamiae kitale"]
+int_data$wasp <- factor(int_data$wasp, levels = c("C. sesamiae kitale",
+                                                              other_levels))
+int_data$host_susceptibility <- factor(int_data$host_susceptibility,
+                                             levels = c("y", "n"))
+other_levels <- unique(as.character(int_data$hostwasp))
+other_levels <- other_levels[other_levels != "B. fusca-C. sesamiae kitale"]
+int_data$hostwasp <- factor(int_data$hostwasp, levels = c("B. fusca-C. sesamiae kitale",
+                                                                          other_levels))
+other_levels <- unique(as.character(int_data_w_HIM$Segment))
+other_levels <- other_levels[other_levels != "Segment_35"]
+int_data_w_HIM$Segment <- factor(int_data_w_HIM$Segment, 
+                                 levels = c("Segment_35", other_levels))
+other_levels <- unique(as.character(int_data_w_HIM$host))
+other_levels <- other_levels[other_levels != "S. calamistis"]
+int_data_w_HIM$host <- factor(int_data_w_HIM$host, levels = c("S. calamistis", 
+                                                              other_levels))
+other_levels <- unique(as.character(int_data_w_HIM$wasp))
+other_levels <- other_levels[other_levels != "C. sesamiae kitale"]
+int_data_w_HIM$wasp <- factor(int_data_w_HIM$wasp, levels = c("C. sesamiae kitale",
+                                                              other_levels))
+int_data_w_HIM$host_susceptibility <- factor(int_data_w_HIM$host_susceptibility,
+                                             levels = c("y", "n"))
+other_levels <- unique(as.character(int_data_w_HIM$hostwasp))
+other_levels <- other_levels[other_levels != "B. fusca-C. sesamiae kitale"]
+int_data_w_HIM$hostwasp <- factor(int_data_w_HIM$hostwasp, levels = c("B. fusca-C. sesamiae kitale",
+                                                              other_levels))
+
+
+
+# normalise for library size
+int_data$cpm <- int_data$norm_depth1/(int_data$library_size/1000000)
+int_data_w_HIM$cpm <- int_data_w_HIM$norm_depth1/(int_data_w_HIM$library_size/1000000)
 
 # transform the normalised depth by taking the cube root
 int_data$depth_cube_root <- int_data$norm_depth1 ^ (1/3)
 int_data_w_HIM$depth_cube_root <- int_data_w_HIM$norm_depth1 ^ (1/3)
+int_data$depth_cube_root_cpm <- int_data$cpm ^ (1/3)
+int_data_w_HIM$depth_cube_root_cpm <- int_data_w_HIM$cpm ^ (1/3)
+plot(depth_cube_root_cpm ~ depth_cube_root, data = int_data)
+
+# visualise the effects of the library size normalisation
+par(mfrow = c(1,2))
+plot(log(int + 1) ~ depth_cube_root, data = int_data,
+     ylab = "log(# int + 1)", xlab = "Corrected Depth ^ 1/3",
+     main = "No LS normalisation")
+plot(log(int + 1) ~ depth_cube_root_cpm, data = int_data,
+     ylab = "log(# int + 1)", xlab = "CPM ^ 1/3",
+     main = "LS normalisation")
+
+# compare library sizes between samples
+par(mfrow = c(1,1))
+ls_table <- aggregate(log(library_size) ~ sample,
+                      FUN = unique,
+                      data = int_data)
+barplot(ls_table[,2] ~ ls_table[,1])
 
 # check which samples have which segments
 for (s in unique(int_data_w_HIM$sample)) {
@@ -1140,109 +984,177 @@ for (s in unique(int_data_w_HIM$sample)) {
 
 ######
 
+# Check whether the order of segments (in terms of depth/number of integrations)
+# is conserved.
+######
+# for this analysis, only keep segments that are present in all the species
+seg_number <- aggregate(depth_cube_root ~ Segment, data = int_data_w_HIM,
+          FUN = length)
+seg_to_keep <- seg_number[seg_number[,2] == 21, 1]
+int_data_w_HIM_all_species <- int_data_w_HIM[int_data_w_HIM$Segment %in% seg_to_keep,]
+# calculate mean depth per segment
+depth_summaries <- aggregate(depth_cube_root_cpm ~ Segment, data = int_data_w_HIM_all_species,
+                         FUN = mean)
+# order the segments by depth
+depth_ordered_temp <- depth_summaries[order(depth_summaries[,2], decreasing = FALSE),]
+depth_ordered_temp <- cbind(depth_ordered_temp, seq(1:25))
+colnames(depth_ordered_temp)[3] <- "Order"
+depth_ordered <- depth_summaries[order(depth_summaries[,2], decreasing = FALSE), 1]
+# make a vector of wasp IDs
+wasps <- unique(int_data_w_HIM$wasp)
+
+# plot correlations between depth values
+plot_order_corrs(depth_ordered, int_data_w_HIM_all_species, wasps,
+                 highlight = HIM_segments)
+######
+
 # Model the number of integrations 
 ######
-# run negative binomial model
-zinb_stan <- run_stan_model(int_data, host_sus = TRUE, iter = 10000)
-# model with weak priors on zero-inflated component
-zinb_stan_weak_prior <- run_stan_model(int_data, host_sus = TRUE, iter = 10000,
-                                        weak_prior = TRUE)
+# remove sample where oviposition appears to have 
+# been unsuccessful
+int_data <- int_data[!int_data$sample == "FAW6",]
+int_data_w_HIM <- int_data_w_HIM[!int_data_w_HIM$sample == "FAW6",]
+int_data <- droplevels(int_data)
+int_data_w_HIM <- droplevels(int_data_w_HIM)
 
-# get posterior predictions
-ppd <- get_ppd(zinb_stan)
+# run negative binomial model
+prior_b0 <- set_prior("normal(0,3)", class = "Intercept")
+prior_b <- set_prior("normal(0,2)", class = "b")
+prior_sd <- set_prior("normal(0,5)", class = "sd")
+prior_shape <- set_prior("inv_gamma(0.4, 0.3)", class = "shape")
+priors <- c(prior_b0, prior_b, prior_sd, prior_shape)
+int_data$depth_cube_root_cpm_scaled <- scale(int_data$depth_cube_root_cpm)
+nb_model <- brm(int ~ Segment + hostwasp + depth_cube_root_cpm_scaled + (1|sample),
+                 data = int_data, family = negbinomial(),
+                 prior = priors, cores = 4, iter = 10000,
+                warmup = 1000, seed = 90)
 
 # difference between the number of integrations at norm depth Q1 vs Q3
-depth_effect_HPDI(zinb_stan, depths = c(6.09, 61.83))
+summary(int_data$cpm)
+depth_effect_HPDI(nb_model, depths = c(0.08108, 0.31570), 
+                  int_data$depth_cube_root_cpm)
 
 # the effect of depth shown with the effect of segment
-ordered <- plot_posteriors_stan_w_depth(zinb_stan, "Segment", "Segment_35", 2, "new_version_of_Ines_manuscript/Figure_3b.pdf",
+ordered <- plot_posteriors_w_depth(nb_model, "Segment", "Segment_35", "new_version_of_Ines_manuscript/Figure_3b.pdf",
                                 int_data, 5, selected = c("Segment_1", "Segment_14"),
-                                selected_pretty = c("Circle 1", "Circle 14"), maximum = 500)
+                                selected_pretty = c("Circle 1", "Circle 14"), maximum = 150)
 # effect of host suitability, shown with the effect of segment
-plot_posteriors_stan_w_depth(zinb_stan, "host_susceptibility", "y", 25, "new_version_of_Ines_manuscript/Figure_5A.pdf",
+plot_posteriors_w_depth(nb_model, "host_susceptibility", "y", "new_version_of_Ines_manuscript/Figure_5A.pdf",
                                         int_data, 5, selected = c("y", "n"),
                              selected_pretty = c("Suitable host", "Non-suitable host"), 
-                             maximum = 400)
+                             maximum = 100)
 
-# plot estimated mus and thetas
-par(mfrow = c(1,1))
-plot_thetas(zinb_stan, int_data, file_name = "figures/Supplementary_Table_1.tsv")
-plot_mus(zinb_stan)
+# check whether having the two non-suitable at the bottom is significant
+empirical_dist <- permutations(n = length(levels(int_data$hostwasp)), r = length(levels(int_data$hostwasp)), v = levels(int_data$hostwasp))
+nonsuitable <- as.character(unique(int_data$hostwasp[int_data$host_susceptibility == "n"]))
+positive <- 0
+for (row in 1:nrow(empirical_dist)) {
+  if (empirical_dist[row, 7] %in% nonsuitable & empirical_dist[row, 8] %in% nonsuitable) {
+    positive <- positive + 1
+  }
+}
+positive/nrow(empirical_dist)
 
 # obtain posterior predictive distribution and visualise either by depth 
 # or by segment ID
-pdf("figures/Figure_R1.pdf", width = 4, height = 4)
-ppd <- zinb_ppd(zinb_stan, int_data, 1000, plot_by_depth = TRUE)
+set.seed(7)
+ppd <- posterior_predict(nb_model)
+pdf("new_version_of_Ines_manuscript/Figure_S7.pdf", width = 4, height = 4)
+plot_ppd(ppd, 1000, int_data, "int", "depth_cube_root_cpm",
+         "Corrected DPM", 
+         "# of integrations", logged = FALSE)
 dev.off()
-ppd <- zinb_ppd(zinb_stan, int_data, 4000, plot_by_segment = TRUE)
-
-# show estimated relationship between the probability of failed oviposition
-# and host + wasp depth, using weak priors and using 
-# priors promoting a negative relationship
-par(mfrow = c(1,2))
-plot_zi_stan(zinb_stan_weak_prior, int_data, "Weak prior")
-plot_zi_stan(zinb_stan, int_data, "Negative-biased prior on betaZI")
 
 # show results for circle, host and wasp
-ordered <- plot_posteriors_stan(zinb_stan, "Difference to Circle 35 in log # of integrations", "Segment", "Segment_35", 2, "new_version_of_Ines_manuscript/Figure_4.pdf",
-                     int_data, 10)
-x <- plot_posteriors_stan(zinb_stan, expression("Difference to "~italic("S. calamistis")~" in log # of integrations"), "host", "S. calamistis", 17, "new_version_of_Ines_manuscript/Figure_S9A.pdf",
-                     int_data, 5)
-x <- plot_posteriors_stan(zinb_stan, expression("Difference to "~italic("C. s. kitale")~" in log # of integrations"), "wasp", "C. sesamiae kitale", 21, "new_version_of_Ines_manuscript/Figure_S9B.pdf",
-                     int_data, 5)
+ordered <- plot_posteriors(int_data, "Segment", nb_model,
+                           "Difference to Circle 35 in log # of integrations", "", "Segment_35", 
+                           file_name = "new_version_of_Ines_manuscript/Figure_4.pdf")
+x <- plot_posteriors(int_data, "hostwasp", nb_model,
+                     expression("Difference to "~italic("C. s.")~" Kitale -"~italic("B. fusca")~" in log # of integrations"), "", "B. fusca-C. s. kitale", 
+                     file_name = "new_version_of_Ines_manuscript/Figure_S9.pdf",
+                     pretty_names = c("C. s. Mombasa - B.fusca",
+                                      "C. s. Mombasa - S. calamistis",
+                                      "C. s. Kitale - S. calamistis",
+                                      "C. flavipes - C. partellus",
+                                      "C. flavipes - S. frugiperda",
+                                      "C. icipe - S. frugiperda",
+                                      "C. typhae - S. nonagrioides"))
 
-# mombasa and flavipes when they're paired with a susceptible
-# vs non-susceptible host
+# modelling results
+pdf("new_version_of_Ines_manuscript/Figure_5A.pdf", width = 6, height = 4)
+par(mfrow = c(1,2))
+plot_posteriors_difference(int_data, "hostwasp", nb_model, 
+                           c("B. fusca-C. sesamiae mombasa", "S. calamistis-C. sesamiae mombasa"), 
+                           pretty_names = c(expression(paste(italic("B. fusca"))), expression(paste(italic("S. calamistis")))),
+                           title = substitute(paste(italic("C. s."), " Mombasa with...")))
+plot_posteriors_difference(int_data, "hostwasp", nb_model, 
+                           c("S. frugiperda-C. flavipes", "C. partellus-C. flavipes"), 
+                           pretty_names = c(expression(paste(italic("S. frugiperda"))), expression(paste(italic("C. partellus")))),
+                           title = substitute(paste(italic("C. flavipes"), " with...")))
+dev.off()
+
+# descriptive data analysis
+# mombasa and flavipes when paired with a suitable vs
+# non-suitable host
+# set up colours
 red <- rgb(186, 0, 0, maxColorValue = 255)
 blue <- rgb(115, 186, 215, maxColorValue = 255)
-pdf(file = "new_version_of_Ines_manuscript/Figure_5B.pdf", width = 5, height = 4)
+pdf(file = "new_version_of_Ines_manuscript/Figure_5B.pdf", width = 6, height = 4)
 par(mfrow = c(1,2))
+# get data only for momabasa
 mombasa <- int_data[int_data$wasp == "C. sesamiae mombasa",]
+# get number of integrations per segment
+# separately for suitable and non-suitable host
 per_segment_data <- aggregate(int ~ Segment + host_susceptibility, data = mombasa,
                               FUN = median)
+# make graph
 yvalues <- c(0, 10, 60)
 yvalues_logged <- log(yvalues + 1)
-stripchart(per_segment_data[,3] ~ per_segment_data[,2], data = mombasa, vertical = TRUE,
-           method = "jitter", main = expression(italic("C. s. mombasa")),
-           xlab = "Host suitability",
-           group.names = c("no", "yes"), pch = 1,
+par("xpd" = TRUE)
+suitability <- factor(per_segment_data$host_susceptibility, 
+                         levels = c("n", "y"))
+stripchart(per_segment_data[,3] ~ suitability, data = mombasa, vertical = TRUE,
+           method = "jitter", main = substitute(paste(italic("C. s."), " Mombasa with...")),
+           xlab = "",
            ylab = "# of integrations",
            col = c(blue, red),
-           ylim = c(0,90))
+           ylim = c(0,90),
+           pch = 1, xaxt = "n", cex.main = 1.3, 
+           cex.axis = 1.3, cex.lab = 1.3, las = 2)
+text(x = c(0.8,1.8), y = -19, labels = c(expression(paste(italic("B. fusca"))), expression(paste(italic("S. calamistis")))),
+     srt = 20, cex = 1.3)
+# now go through all the same steps with flavipes
 flavipes <- int_data[int_data$wasp == "C. flavipes",]
 per_segment_data <- aggregate(int ~ Segment + host_susceptibility, data = flavipes,
                               FUN = median)
-stripchart(per_segment_data[,3] ~ per_segment_data[,2], data = mombasa, vertical = TRUE,
-           method = "jitter", main = expression(italic("C. flavipes")),
-           xlab = "Host suitability",
-           group.names = c("no", "yes"), pch = 1,
+suitability <- factor(per_segment_data$host_susceptibility, 
+                         levels = c("n", "y"))
+stripchart(per_segment_data[,3] ~ suitability, data = mombasa, vertical = TRUE,
+           method = "jitter", main = substitute(paste(italic("C. flavipes"), " with...")),
+           xlab = "", pch = 1,
            ylab = "# of integrations",
            col = c(blue, red),
-           ylim = c(0,90))
+           ylim = c(0,90), xaxt = "n", cex.main = 1.3, 
+           cex.axis = 1.3, cex.lab = 1.3, las = 2)
+text(x = c(0.8,1.8), y = -19, labels = c(expression(paste(italic("S. frugiperda"))), expression(paste(italic("C. partellus")))),
+     srt = 20, cex = 1.3)
+par("xpd" = FALSE)
 dev.off()
-
-# compare estimated mean numbers of integrations between
-# two categories
-compare_two_categories(zinb_stan, NA, 25, c("non-susceptible", "susceptible"),
-                       "Host susceptibility", intercept = TRUE)
-compare_two_categories(zinb_stan, 4, 2, c("Segment 11", "Segment 1"),
-                       "Segment", intercept = FALSE)
-compare_two_categories(zinb_stan, NA, 2, c("Segment 35", "Segment 1"),
-                       "Segment", intercept = TRUE)
-compare_two_categories(zinb_stan, 19, 20, c("B. fusca", "S. nonagrioides"),
-                       "Host", intercept = FALSE)
-compare_two_categories(zinb_stan, 24, 22, c("C. icipe", "C. sesamiae mombasa"),
-                       "Wasp", intercept = FALSE)
-
-# show sample-level random effects
-show_random_effects(zinb_stan, int_data)
 
 ######
 
 # Create simulated data sets and see if the model can recover the ground truth
 ######
+# remove sample where oviposition appears to have 
+# been unsuccessful
+int_data <- int_data[!int_data$sample == "FAW6",]
+int_data_w_HIM <- int_data_w_HIM[!int_data_w_HIM$sample == "FAW6",]
+int_data <- droplevels(int_data)
+int_data_w_HIM <- droplevels(int_data_w_HIM)
+
 # do a single simulation to have access to the column names
-one_sim <- simulate_data(int_data, 36, all_visuals = FALSE)
+one_sim <- simulate_data(int_data, 40, all_visuals = TRUE)
+
 # do 100 simulations
 captured_out <- simulate_data_wrapper(int_data, 100, 25)
 # label the results from the 100 simulations
@@ -1265,43 +1177,35 @@ captured_no_depth <- read.table("captured_no_depth_120325.txt", header = TRUE)
 above0 <- read.table("above0_depth_120325.txt", header = TRUE)
 above0_no_depth <- read.table("above0_no_depth_120325.txt", header = TRUE)
 
-# for convenience, repeat the part of teh simulation that creates the ground truth
+# for convenience, repeat the part of the simulation that creates the ground truth
 # just to have the values easily available
-X <- cbind(cat_to_num(int_data$Segment, "Segment_35"),
-           cat_to_num(int_data$host, "S. calamistis"),
-           cat_to_num(int_data$wasp, "C. sesamiae kitale"))
-coef_names <- c(colnames(X), "host_sus")
-depth_coefs_seg <- simulate_coefficients("Segment", c(3, 6, 9), 2, int_data, "Segment_35")[["coefs_unique"]]
-depth_coefs_host <- simulate_coefficients("host", 2, 2, int_data, "S. calamistis")[["coefs_unique"]]
-depth_coefs_wasp <- simulate_coefficients("wasp", 3, -3, int_data, "C. sesamiae kitale")[["coefs_unique"]]
-depth_coefs <- c(depth_coefs_seg, depth_coefs_host, depth_coefs_wasp)
-names(depth_coefs) <- coef_names[-length(coef_names)]
+depth_coefs_seg <- simulate_coefficients("Segment", c(4, 7, 10), 0.5, int_data, "Segment_35")[["coefs_unique"]]
+depth_coefs_hostwasp <- simulate_coefficients("hostwasp", 4, 0.5, int_data, "B. fusca-C. sesamiae kitale")[["coefs_unique"]]
+depth_coefs <- c(depth_coefs_seg, depth_coefs_hostwasp)
+names(depth_coefs) <- one_sim$stat_names[startsWith(one_sim$stat_names, "b_")][-c(1,2)]
 
-coefs_segment <- simulate_coefficients("Segment", c(1,2), 1, int_data, "Segment_35")[["coefs_unique"]]
-coefs_host <- simulate_coefficients("host", c(5), -1, int_data, "S. calamistis")[["coefs_unique"]]
-coefs_wasp <- simulate_coefficients("wasp", c(3), 1, int_data, "C. sesamiae kitale")[["coefs_unique"]]
-coefs_host_sus <- simulate_coefficients("host_susceptibility", c(2), -2, int_data, "y")[["coefs_unique"]]
-int_coefs <- c(coefs_segment, coefs_host, coefs_wasp, coefs_host_sus)
-names(int_coefs) <- coef_names
+coefs_segment <- simulate_coefficients("Segment", c(2,3), 1, int_data, "Segment_35")[["coefs_unique"]]
+coefs_hostwasp <- simulate_coefficients("hostwasp", c(5), 1, int_data, "B. fusca-C. sesamiae kitale")[["coefs_unique"]]
+int_coefs <- c(coefs_segment, coefs_hostwasp)
+names(int_coefs) <- one_sim$stat_names[startsWith(one_sim$stat_names, "b_")][-c(1,2)]
   
-change_to_depth <- which(depth_coefs != 0) + 1
-change_to_int <- which(int_coefs != 0) + 1
+change_to_depth <- which(depth_coefs != 0)
+change_to_int <- which(int_coefs != 0)
 
 # plot a single simulation
-beta_pos <- which(startsWith(colnames(above0), "beta"))
+beta_pos <- which(startsWith(colnames(above0), "b_"))[-c(1,2)]
 pdf("new_version_of_Ines_manuscript/Figure_S11B.pdf", width = 4, height = 4)
 par(mfrow = c(1,1))
-pretty_names <- c("Circle 1", "Circle 10", expression(italic("S. nonagrioides")),
-                  "Non-suitable host", expression(italic("C. flavipes")), "Circle 11",
-                  "Circle 16", "Circle 24")
-pretty_names_no_expr <- c("Circle 1", "Circle 10", "S. nonagrioides",
-                  "Non-suitable host", "C. flavipes", "Circle 11",
-                  "Circle 16", "Circle 24")
-italic_names <- c("Circle 1", "Circle 10", expression(italic("S. nonagrioides")),
-                  "Non-suitable host", expression(italic("C. flavipes")), "Circle 11",
-                  "Circle 16", "Circle 24")
-cols <- c(rep("steelblue3", 5), rep("grey", 3))
-plot_true_with_estimated(one_sim, beta_pos[c(change_to_int[-4], change_to_int[4], change_to_depth[1:3])], 
+pretty_names <- c("Circle 1", "Circle 10", expression(italic("C. flavipes-C. partellus")),
+                  "Circle 11",
+                  "Circle 16", "Circle 24",
+                  expression(italic("C. s. kitale-S. calamistis")))
+pretty_names_no_expr <- c("Circle 1", "Circle 10", "C. flavipes-C. partellus",
+                          "Circle 11",
+                          "Circle 16", "Circle 24",
+                          "C. s. kitale-S. calamistis")
+cols <- c(rep("steelblue3", 3), rep("grey", 4))
+plot_true_with_estimated(one_sim, beta_pos[c(change_to_int, change_to_depth)], 
                          cols,
                          labels = pretty_names,
                          with_depth_only = TRUE,
@@ -1311,7 +1215,7 @@ dev.off()
 # without controlling for depth
 pdf("new_version_of_Ines_manuscript/Figure_S12B.pdf", width = 4, height = 4)
 par(mfrow = c(1,1))
-plot_true_with_estimated(one_sim, beta_pos[c(change_to_int[-4], change_to_int[4], change_to_depth[1:3])], 
+plot_true_with_estimated(one_sim, beta_pos[c(change_to_int, change_to_depth)], 
                          cols,
                          labels = pretty_names,
                          with_depth_only = FALSE,
@@ -1320,10 +1224,16 @@ dev.off()
 
 # plot all simulations
 pdf("new_version_of_Ines_manuscript/Figure_S11A.pdf", height = 4, width = 5)
-columns_to_check <- beta_pos[c(change_to_int[-4], change_to_int[4], change_to_depth[1:3])]
+columns_to_check <- beta_pos[c(change_to_int, change_to_depth)]
 above <- apply(above0[, columns_to_check], 2, FUN = median) * 100
+aboveq1 <- apply(above0[, columns_to_check], 2, FUN = function(x) {quantile(x, 1/3)}) * 100
+aboveq3 <- apply(above0[, columns_to_check], 2, FUN = function(x) {quantile(x, 2/3)}) * 100
 below <- -(100 - above)
+belowq1 <- -(100 - aboveq1)
+belowq3 <- -(100 - aboveq3)
 for_plotting <- data.frame("Probability of effect" = c(above, below),
+                           "Q1" = c(aboveq1, belowq1),
+                           "Q3" = c(aboveq3, belowq3),
                            "Direction" = c(rep("Increased", length(above)),
                                            rep("Decreased", length(below))),
                            "Predictor" = rep(pretty_names_no_expr, 2),
@@ -1338,7 +1248,7 @@ ggplot(for_plotting, aes(x = Predictor, group = Direction, y = `Probability of e
         legend.title=element_blank()) +
   geom_hline(yintercept = c(95, -95), 
              color = "grey", linetype = "dashed", linewidth = 0.5) + 
-  scale_x_discrete(labels = italic_names)
+  scale_x_discrete(labels = pretty_names)
 dev.off()
 
 pdf("new_version_of_Ines_manuscript/Figure_S12A.pdf", height = 4, width = 5)
@@ -1359,212 +1269,90 @@ ggplot(for_plotting, aes(x = Predictor, group = Direction, y = `Probability of e
         legend.title=element_blank()) +
   geom_hline(yintercept = c(95, -95), 
              color = "grey", linetype = "dashed", linewidth = 0.5) + 
-  scale_x_discrete(labels = italic_names)
+  scale_x_discrete(labels = pretty_names)
 dev.off()
 
 pdf("new_version_of_Ines_manuscript/Figure_S10.pdf", height = 5, width = 8)
+margins <- par("mar")
+par("mar" = c(10.1, 4.1, 4.1, 2.1))
+clean_names <- c("Intercept" , "Corrected CPM ^ (1/3)" , "Circle 1", "Circle 10" , "Circle 11" , "Circle 12" , "Circle 14" , "Circle 16" , "Circle 17" , "Circle 18" , "Circle 24" , "Circle 26" , "Circle 27" , "Circle 28" , "Circle 32" , "Circle 4", "Circle 7", "C. s. mombasa - B. fusca" , "C. s. mombasa - S. calamistis", "C. s. kitale - S. calamistis" , "C. flavipes - C. partellus", "C. flavipes - S. frugiperda" , "C. icipe - S. frugiperda", "C.typhae - S. nonagrioides" , "phi" , "alpha 1", "alpha 2" , "alpha 3" , "alpha 4" , "alpha 5" , "alpha 6" , "alpha 7" , "alpha 8" , "alpha 9" , "alpha 10" , "alpha 11" , "alpha 12" , "alpha 13" , "alpha 14", "alpha 15", "alpha 16" , "alpha 17" , "alpha 18" , "alpha 19" , "alpha 20" , "sigma")
 barplot(colMeans(captured), 
         main = "",
-        col = "salmon", names = colnames(captured),
+        col = "salmon", names = clean_names,
         las = 2, cex.names = 0.75,
         cex.axis = 0.75, cex.lab = 0.75,
         ylab = "Proportion of simulations where 95% HPDI includes true value")
 abline(h = 0.95, lty = 2, lwd = 2, col = "black")
+par("mar" = margins)
 dev.off()
 
-median(colMeans(captured_out$captured[, beta_pos[-1]]))
+# check how reliably the efects are detected
+colnames(above0) <- one_sim$stat_names
+median(above0$b_hostwaspC.partellusMC.flavipes)
+median(above0$b_SegmentSegment_1)
+median(above0$b_SegmentSegment_10)
 
-######
-
-# Data exploration prior to modelling depth as the outcome
-######
-# visualise the outcome variable
-hist(int_data_w_HIM$depth_cube_root)
-# visualise the relationship with the replication unit
-vioplot(depth_cube_root ~ Replication_Unit, data = int_data_w_HIM,
-           las = 2)
-
-# order the segments as a function of median depth for visualisation
-ordering <- aggregate(depth_cube_root ~ Segment, data = int_data_w_HIM,
-                      FUN = median)
-ordering <- ordering[order(ordering[,2], decreasing = TRUE), 1]
-segments_ordered <- factor(int_data_w_HIM$Segment, levels = ordering)
-
-# plot out depth by segment and replication unit
-# shows that most RUs only containe 1-2 segments, so it will be
-# hard to get anything out of this predictor
-pdf("depth_by_segment_and_ru.pdf")
-par(mfrow = c(2,2))
-for (ru in unique(int_data_w_HIM$Replication_Unit)) {
-  curr_segs <- unique(int_data_w_HIM[int_data_w_HIM$Replication_Unit == ru, "Segment"])
-  segs <- levels(segments_ordered)
-  cols <- rep("white", length(segs))
-  cols[segs %in% curr_segs] <- "black"
-  HIM_cols <- c()
-  for (seg in segs) {
-    him <- unique(int_data_w_HIM[int_data_w_HIM$Segment == seg, "HIM"])
-    if (him == "n") {
-      HIM_cols <- c(HIM_cols, "lightblue2")
-    }
-    else {
-      HIM_cols <- c(HIM_cols, "pink3")
-    }
-  }
-  vioplot(int_data_w_HIM$depth_cube_root ~ segments_ordered, 
-          col = cols, las = 2, main = ru, xlab = "", cex.axis = 0.55,
-          ylab = "Norm. Depth ^ 1/3", colMed = HIM_cols, rect_col = "grey",
-          lineCol = "grey", border = "grey")
-}
-dev.off()
-
-# plot out depth by segment
-pdf("figures/Figure_SR5.pdf")
-par(mfrow = c(1,1))
-HIM_cols <- c()
-for (seg in levels(segments_ordered_old)) {
-  him <- unique(int_data_w_HIM[int_data_w_HIM$Segment == seg, "HIM"])
-  if (him == "n") {
-    HIM_cols <- c(HIM_cols, "lightblue2")
-  }
-  else {
-    HIM_cols <- c(HIM_cols, "pink3")
-  }
-}
-segments_ordered_old <- segments_ordered
-ordering <- gsub("Segment_", "Circle ", ordering)
-segments_ordered <- factor(gsub("Segment_", "Circle ", segments_ordered), levels = ordering)
-segs <- levels(segments_ordered)
-
-vioplot(int_data_w_HIM$depth_cube_root ~ segments_ordered, 
-          las = 2, main = "", xlab = "", cex.axis = 0.55,
-          ylab = "Corrected depth", col = HIM_cols, yaxt = "n")
-labels <- c(0, 10, 100, 300)
-axis(side = 2, at = labels ^ (1/3), labels = labels,
-     las = 2)
-dev.off()
 
 ######
 
 # Model depth as outcome
 ######
-# convert the categorical variables to factors
-# making sure that the first level is always the same as the 
-# baseline used in the model of the number of integrations
-other_levels <- unique(as.character(int_data_w_HIM$Segment))
-other_levels <- other_levels[other_levels != "Segment_35"]
-int_data_w_HIM$Segment <- factor(int_data_w_HIM$Segment, 
-                                 levels = c("Segment_35", other_levels))
-other_levels <- unique(as.character(int_data_w_HIM$host))
-other_levels <- other_levels[other_levels != "S. calamistis"]
-int_data_w_HIM$host <- factor(int_data_w_HIM$host, levels = c("S. calamistis", 
-                                                              other_levels))
-other_levels <- unique(as.character(int_data_w_HIM$wasp))
-other_levels <- other_levels[other_levels != "C. sesamiae kitale"]
-int_data_w_HIM$wasp <- factor(int_data_w_HIM$wasp, levels = c("C. sesamiae kitale",
-                                                              other_levels))
-int_data_w_HIM$host_susceptibility <- factor(int_data_w_HIM$host_susceptibility,
-                                             levels = c("y", "n"))
+# remove sample where oviposition appears to have 
+# been unsuccessful
+int_data <- int_data[!int_data$sample == "FAW6",]
+int_data_w_HIM <- int_data_w_HIM[!int_data_w_HIM$sample == "FAW6",]
+int_data <- droplevels(int_data)
+int_data_w_HIM <- droplevels(int_data_w_HIM)
+
 # set priors
 prior_b0_depth <- set_prior("normal(0,4)",
                       class = "Intercept")
 prior_b_depth <- set_prior("normal(0,2)",
                      class = "b")
-prior_b_depth_ls <- set_prior("normal(0,10)",
-                           class = "b",
-                           coef = "scalelog.host_BUSCO_depth")
 prior_sd_depth <- set_prior("normal(0,2)", class = "sigma")
 prior_re_sd_depth <- set_prior("normal(0,5)", class = "sd")
 
 # fit model without the replication unit and HIM presence as a predictors
-depth_model_no_HIM_pred <- brm(depth_cube_root ~ host + wasp + Segment + scale(log.host_BUSCO_depth) + (1|sample) + host_susceptibility,
-                            data = int_data_w_HIM,
-                            family = gaussian(), cores = 4,
-                            prior = c(prior_b0_depth,
-                                      prior_b_depth,
-                                      prior_b_depth_ls,
-                                      prior_sd_depth,
-                                      prior_re_sd_depth),
-                            iter = 10000,
-                            seed = 78)
+depth_model_no_HIM_pred <- brm(depth_cube_root_cpm ~ hostwasp + Segment + (1|sample),
+                               data = int_data_w_HIM,
+                               family = gaussian(), cores = 4,
+                               prior = c(prior_b0_depth,
+                                         prior_b_depth,
+                                         prior_sd_depth,
+                                         prior_re_sd_depth),
+                               iter = 10000, warmup = 1000,
+                               seed = 78)
 
 # plot the posterior distributions of the coefficients
-plot_posteriors(int_data_w_HIM, "Segment", depth_model_no_HIM_pred, "Difference to Circle 35 in corrected depth", baseline = "Circle 35", subtract_for_HIM = FALSE, col_by_HIM = TRUE, file_name = "new_version_of_Ines_manuscript/Figure_6.pdf")
-plot_posteriors(int_data_w_HIM, "host", depth_model_no_HIM_pred, expression("Difference to "~italic("S. calamistis")~" in corrected depth"), baseline = "S. calamistis", subtract_for_HIM = FALSE, col_by_HIM = FALSE, file_name = "new_version_of_Ines_manuscript/Figure_7A.pdf")
-plot_posteriors(int_data_w_HIM, "wasp", depth_model_no_HIM_pred, expression("Difference to "~italic("C. s. kitale")~" in corrected depth"), baseline = "C. sesamiae kitale", subtract_for_HIM = FALSE, col_by_HIM = FALSE, file_name = "new_version_of_Ines_manuscript/Figure_7B.pdf")
-
-# effect of segment
-new_data <- int_data_w_HIM[1:2,]
-new_data$host <- "S. calamistis"
-new_data$wasp <- "C. sesamiae kitale"
-new_data$host_susceptibility <- "y"
-new_data$HIM <- "n"
-new_data$log.host_BUSCO_depth <- mean(int_data_w_HIM$log.host_BUSCO_depth)
-new_data$Segment <- c("Segment_1", "Segment_37")
-ped <- posterior_epred(depth_model_no_HIM_pred, newdata = new_data,
-                       re_formula = NA)
-ped <- ped ^ 3
-ratios <- ped[,1] - ped[,2]
-HPDI(ratios, 0.95)
-median(ratios)
-
-# effect of host susceptibility
-new_data$host_susceptibility <- c("y","n")
-new_data$Segment <- "Segment_35"
-ped <- posterior_epred(depth_model_no_HIM_pred, newdata = new_data,
-                       re_formula = NA)
-ped <- ped ^ 3
-ratios <- ped[,1] - ped[,2]
-HPDI(ratios, 0.95)
-median(ratios)
-mean(ratios > 1)
-
-# effect of HIM
-new_data$host_susceptibility <- "y"
-new_data$HIM <- c("y", "n")
-ped <- posterior_epred(depth_model_HIM_pred, newdata = new_data,
-                       re_formula = NA)
-ped <- ped ^ 3
-ratios <- ped[,1] - ped[,2]
-HPDI(ratios, 0.95)
-median(ratios)
-mean(ratios > 0)
-
-# effect of host
-new_data$HIM <- "n"
-new_data$host <- c("S. calamistis", "B. fusca")
-ped <- posterior_epred(depth_model_HIM_pred, newdata = new_data,
-                       re_formula = NA)
-ped <- ped ^ 3
-ratios <- ped[,1] - ped[,2]
-HPDI(ratios, 0.95)
-median(ratios)
-mean(ratios > 0)
-
-# effect of wasp
-new_data$host <- "S. calamistis"
-new_data$wasp <- c("C. sesamiae kitale", "C. sesamiae mombasa")
-ped <- posterior_epred(depth_model_HIM_pred, newdata = new_data,
-                       re_formula = NA)
-ped <- ped ^ 3
-ratios <- ped[,1] - ped[,2]
-HPDI(ratios, 0.95)
-median(ratios)
-mean(ratios > 0)
+results_depth <- plot_posteriors(int_data_w_HIM, "Segment", depth_model_no_HIM_pred, "Difference to Circle 35 in corrected DPM (cube root)", baseline = "Circle 35", subtract_for_HIM = FALSE, col_by_HIM = TRUE, file_name = "new_version_of_Ines_manuscript/Figure_6.pdf", cube_root = TRUE)
+plot_posteriors(int_data_w_HIM, "hostwasp", depth_model_no_HIM_pred, 
+                expression("Difference to "~italic("C. s.")~" Kitale -"~italic("B. fusca")~"in corrected DPM (cube root)"), 
+                baseline = "B. fusca-C. sesamiae kitale", 
+                subtract_for_HIM = FALSE, 
+                col_by_HIM = FALSE, 
+                file_name = "new_version_of_Ines_manuscript/Figure_7.pdf", 
+                cube_root = TRUE,
+                pretty_names = c("C. s. Mombasa - B.fusca",
+                                 "C. s. Mombasa - S. calamistis",
+                                 "C. s. Kitale - S. calamistis",
+                                 "C. flavipes - C. partellus",
+                                 "C. flavipes - S. frugiperda",
+                                 "C. icipe - S. frugiperda",
+                                 "C. typhae - S. nonagrioides"))
 
 # check posterior predictions
 ppd <- posterior_predict(depth_model_no_HIM_pred)
 pdf("new_version_of_Ines_manuscript/Figure_S13A.pdf", width = 4, height = 4)
-plot_ppd(ppd, 1000, int_data_w_HIM, "depth_cube_root", "log.host_BUSCO_depth",
-         "Host BUSCO depth", 
-         "Corrected depth", logged = FALSE)
+pp_check(depth_model_no_HIM_pred, ndraws = 1000) + 
+  labs(x = "Corrected DPM") + 
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=20),
+        text = element_text(family = "sans")) +
+  theme(legend.position="none")
 dev.off()
-plot_ppd(ppd, 1000, int_data_w_HIM, "depth_cube_root", "log.host_BUSCO_depth",
-         "Host BUSCO depth", 
-         "Corrected depth", logged = FALSE, 
-         plot_medians = TRUE)
-pdf("new_version_of_Ines_manuscript/Figure_S13B.pdf", width = 7, height = 5)
-plot_ppd_by_segment(ppd, 1000, int_data_w_HIM, "depth_cube_root",
-         "Corrected depth", logged = FALSE)
+pdf("new_version_of_Ines_manuscript/Figure_S13B.pdf", width = 5, height = 4)
+plot_ppd_by_segment(ppd, 1000, int_data_w_HIM, "depth_cube_root_cpm",
+         "Corrected DPM", logged = FALSE)
 dev.off()
 ######
 
